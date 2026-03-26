@@ -1,0 +1,17 @@
+.DS_Store
+
+# Build artifacts
+proxy-pool
+*.exe
+*.out
+
+# Runtime data
+*.db
+*.log
+config.json
+data/*.db
+data/config.json
+
+# IDE files
+.idea/
+.vscode/

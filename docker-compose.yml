@@ -1,0 +1,24 @@
+services:
+  proxygo:
+    build: .
+    container_name: proxygo
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7777:7777"   # HTTP 代理端口（仅内网）
+      - "7778:7778"               # WebUI 端口（外网可访问）
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      - DATA_DIR=/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7778/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - cursor2api_default
+
+networks:
+  cursor2api_default:
+    external: true

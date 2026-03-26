@@ -1,0 +1,6 @@
+proxy-pool
+proxy-pool.log
+proxy.db
+config.json
+data/
+*.log
