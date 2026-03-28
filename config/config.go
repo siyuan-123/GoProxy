@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-const DefaultPassword = "proxygo"
+const DefaultPassword = "goproxy"
 
 func dataDir() string {
 	if d := os.Getenv("DATA_DIR"); d != "" {
@@ -27,37 +27,57 @@ type Config struct {
 	// WebUI 密码 SHA256 哈希
 	WebUIPasswordHash string
 
-	// 代理池本地监听端口
+	// 代理池本地监听端口（随机轮换模式）
 	ProxyPort string
+
+	// 稳定代理端口（最低延迟模式）
+	StableProxyPort string
 
 	// SQLite 数据库路径
 	DBPath string
 
-	// 验证并发数
-	ValidateConcurrency int
+	// ========== 池子容量配置 ==========
+	PoolMaxSize        int     // 代理池总容量（默认100）
+	PoolHTTPRatio      float64 // HTTP协议占比（默认0.5）
+	PoolMinPerProtocol int     // 每协议最小保证（默认10）
 
-	// 验证超时（秒）
-	ValidateTimeout int
+	// ========== 延迟标准配置 ==========
+	MaxLatencyMs          int // 标准模式最大延迟（默认2000ms）
+	MaxLatencyEmergency   int // 紧急模式放宽延迟（默认3000ms）
+	MaxLatencyHealthy     int // 健康模式严格延迟（默认1500ms）
+	MaxLatencyDegradation int // 降级模式超宽松延迟（默认5000ms）
 
-	// 验证目标 URL
-	ValidateURL string
+	// ========== 验证配置 ==========
+	ValidateConcurrency int    // 验证并发数（默认300）
+	ValidateTimeout     int    // 验证超时（秒）（默认8）
+	ValidateURL         string // 验证目标 URL
 
-	// 最大响应时间（毫秒），超过则丢弃
-	MaxResponseMs int
+	// ========== 健康检查配置 ==========
+	HealthCheckInterval   int // 状态监控间隔（分钟）（默认5）
+	HealthCheckBatchSize  int // 每批验证数量（默认20）
+	HealthCheckConcurrency int // 批次内并发数（默认50）
 
-	// 代理失败次数阈值，超过后删除
-	MaxFailCount int
+	// ========== 优化配置 ==========
+	OptimizeInterval    int     // 优化轮换间隔（分钟）（默认30）
+	OptimizeConcurrency int     // 优化时并发数（默认100）
+	ReplaceThreshold    float64 // 替换阈值（默认0.7，新代理需快30%）
 
-	// 自动重试次数
-	MaxRetry int
+	// ========== IP查询配置 ==========
+	IPQueryRateLimit int // IP查询限流（次/秒）（默认10）
 
-	// 定时抓取间隔（分钟）
-	FetchInterval int
+	// ========== 源管理配置 ==========
+	SourceFailThreshold    int // 源降级阈值（默认3）
+	SourceDisableThreshold int // 源禁用阈值（默认5）
+	SourceCooldownMinutes  int // 源禁用冷却时间（默认30）
 
-	// 定时健康检查间隔（分钟）
-	CheckInterval int
+	// ========== 兼容旧配置 ==========
+	MaxResponseMs int // 已废弃，使用 MaxLatencyMs 替代
+	MaxFailCount  int // 代理失败次数阈值
+	MaxRetry      int // 请求失败后的重试次数
+	FetchInterval int // 已废弃，由智能抓取器管理
+	CheckInterval int // 已废弃，由 HealthCheckInterval 替代
 
-	// 代理来源 URL
+	// 代理来源 URL（已废弃，内置多源）
 	HTTPSourceURL   string
 	SOCKS5SourceURL string
 }
@@ -78,20 +98,55 @@ func DefaultConfig() *Config {
 		password = DefaultPassword
 	}
 	return &Config{
-		WebUIPort:           ":7778",
-		WebUIPasswordHash:   passwordHash(password),
-		ProxyPort:           ":7777",
-		DBPath:              dataDir() + "proxy.db",
+		// 基础服务配置
+		WebUIPort:         ":7778",
+		WebUIPasswordHash: passwordHash(password),
+		ProxyPort:         ":7777",
+		StableProxyPort:   ":7776",
+		DBPath:            dataDir() + "proxy.db",
+
+		// 池子容量配置
+		PoolMaxSize:        100,  // 总容量
+		PoolHTTPRatio:      0.5,  // HTTP占50%
+		PoolMinPerProtocol: 10,   // 每协议最少10个
+
+		// 延迟标准配置
+		MaxLatencyMs:          2000, // 标准2秒
+		MaxLatencyEmergency:   3000, // 紧急3秒
+		MaxLatencyHealthy:     1500, // 健康1.5秒
+		MaxLatencyDegradation: 5000, // 降级5秒
+
+		// 验证配置
 		ValidateConcurrency: 300,
-		ValidateTimeout:     3,
-		ValidateURL:         "https://cursor.com/api/auth/me",
-		MaxResponseMs:       2500,
-		MaxFailCount:        3,
-		MaxRetry:            3,
-		FetchInterval:       30,
-		CheckInterval:       10,
-		HTTPSourceURL:       "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
-		SOCKS5SourceURL:     "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt",
+		ValidateTimeout:     8,
+		ValidateURL:         "http://www.gstatic.com/generate_204",
+
+		// 健康检查配置
+		HealthCheckInterval:    5,  // 5分钟
+		HealthCheckBatchSize:   20, // 每批20个
+		HealthCheckConcurrency: 50, // 批次并发50
+
+		// 优化配置
+		OptimizeInterval:    30,  // 30分钟
+		OptimizeConcurrency: 100, // 并发100
+		ReplaceThreshold:    0.7, // 新代理需快30%
+
+		// IP查询配置
+		IPQueryRateLimit: 10, // 10次/秒
+
+		// 源管理配置
+		SourceFailThreshold:    3,  // 失败3次降级
+		SourceDisableThreshold: 5,  // 失败5次禁用
+		SourceCooldownMinutes:  30, // 禁用30分钟
+
+		// 兼容旧配置
+		MaxResponseMs: 5000,
+		MaxFailCount:  3,
+		MaxRetry:      3,
+		FetchInterval: 30,
+		CheckInterval: 10,
+		HTTPSourceURL: "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
+		SOCKS5SourceURL: "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt",
 	}
 }
 
@@ -100,20 +155,60 @@ func Load() *Config {
 	cfg := DefaultConfig()
 	data, err := os.ReadFile(ConfigFile())
 	if err == nil {
-		// 只覆盖可调整的4个字段
 		var saved savedConfig
 		if json.Unmarshal(data, &saved) == nil {
-			if saved.FetchInterval > 0 {
-				cfg.FetchInterval = saved.FetchInterval
+			// 池子配置
+			if saved.PoolMaxSize > 0 {
+				cfg.PoolMaxSize = saved.PoolMaxSize
 			}
-			if saved.CheckInterval > 0 {
-				cfg.CheckInterval = saved.CheckInterval
+			if saved.PoolHTTPRatio > 0 && saved.PoolHTTPRatio <= 1 {
+				cfg.PoolHTTPRatio = saved.PoolHTTPRatio
 			}
+			if saved.PoolMinPerProtocol > 0 {
+				cfg.PoolMinPerProtocol = saved.PoolMinPerProtocol
+			}
+
+			// 延迟配置
+			if saved.MaxLatencyMs > 0 {
+				cfg.MaxLatencyMs = saved.MaxLatencyMs
+			}
+			if saved.MaxLatencyEmergency > 0 {
+				cfg.MaxLatencyEmergency = saved.MaxLatencyEmergency
+			}
+			if saved.MaxLatencyHealthy > 0 {
+				cfg.MaxLatencyHealthy = saved.MaxLatencyHealthy
+			}
+
+			// 验证配置
 			if saved.ValidateConcurrency > 0 {
 				cfg.ValidateConcurrency = saved.ValidateConcurrency
 			}
 			if saved.ValidateTimeout > 0 {
 				cfg.ValidateTimeout = saved.ValidateTimeout
+			}
+
+			// 健康检查配置
+			if saved.HealthCheckInterval > 0 {
+				cfg.HealthCheckInterval = saved.HealthCheckInterval
+			}
+			if saved.HealthCheckBatchSize > 0 {
+				cfg.HealthCheckBatchSize = saved.HealthCheckBatchSize
+			}
+
+			// 优化配置
+			if saved.OptimizeInterval > 0 {
+				cfg.OptimizeInterval = saved.OptimizeInterval
+			}
+			if saved.ReplaceThreshold > 0 && saved.ReplaceThreshold <= 1 {
+				cfg.ReplaceThreshold = saved.ReplaceThreshold
+			}
+
+			// 兼容旧配置
+			if saved.FetchInterval > 0 {
+				cfg.FetchInterval = saved.FetchInterval
+			}
+			if saved.CheckInterval > 0 {
+				cfg.CheckInterval = saved.CheckInterval
 			}
 		}
 	}
@@ -130,31 +225,91 @@ func Get() *Config {
 	return globalCfg
 }
 
-// savedConfig 只持久化可调整的字段
+// savedConfig 持久化可调整的字段
 type savedConfig struct {
-	FetchInterval       int `json:"fetch_interval"`
-	CheckInterval       int `json:"check_interval"`
+	// 池子配置
+	PoolMaxSize        int     `json:"pool_max_size"`
+	PoolHTTPRatio      float64 `json:"pool_http_ratio"`
+	PoolMinPerProtocol int     `json:"pool_min_per_protocol"`
+
+	// 延迟配置
+	MaxLatencyMs        int `json:"max_latency_ms"`
+	MaxLatencyEmergency int `json:"max_latency_emergency"`
+	MaxLatencyHealthy   int `json:"max_latency_healthy"`
+
+	// 验证配置
 	ValidateConcurrency int `json:"validate_concurrency"`
 	ValidateTimeout     int `json:"validate_timeout"`
+
+	// 健康检查配置
+	HealthCheckInterval  int `json:"health_check_interval"`
+	HealthCheckBatchSize int `json:"health_check_batch_size"`
+
+	// 优化配置
+	OptimizeInterval int     `json:"optimize_interval"`
+	ReplaceThreshold float64 `json:"replace_threshold"`
+
+	// 兼容旧配置
+	FetchInterval int `json:"fetch_interval,omitempty"`
+	CheckInterval int `json:"check_interval,omitempty"`
 }
 
-// Save 保存可调整字段到文件，并更新内存配置
-func Save(fetchInterval, checkInterval, validateConcurrency, validateTimeout int) error {
+// Save 保存配置到文件，并更新内存配置
+func Save(cfg *Config) error {
 	cfgMu.Lock()
-	globalCfg.FetchInterval = fetchInterval
-	globalCfg.CheckInterval = checkInterval
-	globalCfg.ValidateConcurrency = validateConcurrency
-	globalCfg.ValidateTimeout = validateTimeout
+	*globalCfg = *cfg
 	cfgMu.Unlock()
 
 	data, err := json.MarshalIndent(savedConfig{
-		FetchInterval:       fetchInterval,
-		CheckInterval:       checkInterval,
-		ValidateConcurrency: validateConcurrency,
-		ValidateTimeout:     validateTimeout,
+		PoolMaxSize:          cfg.PoolMaxSize,
+		PoolHTTPRatio:        cfg.PoolHTTPRatio,
+		PoolMinPerProtocol:   cfg.PoolMinPerProtocol,
+		MaxLatencyMs:         cfg.MaxLatencyMs,
+		MaxLatencyEmergency:  cfg.MaxLatencyEmergency,
+		MaxLatencyHealthy:    cfg.MaxLatencyHealthy,
+		ValidateConcurrency:  cfg.ValidateConcurrency,
+		ValidateTimeout:      cfg.ValidateTimeout,
+		HealthCheckInterval:  cfg.HealthCheckInterval,
+		HealthCheckBatchSize: cfg.HealthCheckBatchSize,
+		OptimizeInterval:     cfg.OptimizeInterval,
+		ReplaceThreshold:     cfg.ReplaceThreshold,
+		FetchInterval:        cfg.FetchInterval,
+		CheckInterval:        cfg.CheckInterval,
 	}, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(ConfigFile(), data, 0644)
+}
+
+// CalculateSlots 根据配置计算各协议的槽位数
+func (c *Config) CalculateSlots() (httpSlots, socks5Slots int) {
+	httpSlots = int(float64(c.PoolMaxSize) * c.PoolHTTPRatio)
+	socks5Slots = c.PoolMaxSize - httpSlots
+
+	// 保证最小值
+	if httpSlots < c.PoolMinPerProtocol {
+		httpSlots = c.PoolMinPerProtocol
+	}
+	if socks5Slots < c.PoolMinPerProtocol {
+		socks5Slots = c.PoolMinPerProtocol
+	}
+
+	return
+}
+
+// GetLatencyThreshold 根据池子状态返回合适的延迟阈值
+func (c *Config) GetLatencyThreshold(poolStatus string) int {
+	switch poolStatus {
+	case "emergency":
+		return c.MaxLatencyEmergency
+	case "critical":
+		return c.MaxLatencyEmergency
+	case "warning":
+		return c.MaxLatencyMs
+	case "healthy":
+		return c.MaxLatencyHealthy
+	default:
+		return c.MaxLatencyMs
+	}
 }

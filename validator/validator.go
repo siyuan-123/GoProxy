@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -10,8 +11,8 @@ import (
 	"time"
 
 	"golang.org/x/net/proxy"
-	"proxy-pool/config"
-	"proxy-pool/storage"
+	"goproxy/config"
+	"goproxy/storage"
 )
 
 type Validator struct {
@@ -43,9 +44,41 @@ func New(concurrency, timeoutSec int, validateURL string) *Validator {
 }
 
 type Result struct {
-	Proxy   storage.Proxy
-	Valid   bool
-	Latency time.Duration
+	Proxy        storage.Proxy
+	Valid        bool
+	Latency      time.Duration
+	ExitIP       string
+	ExitLocation string
+}
+
+// getExitIPInfo 通过代理获取出口 IP 和地理位置
+func getExitIPInfo(client *http.Client) (string, string) {
+	// 使用 ip-api.com 返回 JSON 格式的 IP 信息
+	resp, err := client.Get("http://ip-api.com/json/?fields=status,country,countryCode,city,query")
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Status      string `json:"status"`
+		Query       string `json:"query"`       // IP 地址
+		Country     string `json:"country"`
+		CountryCode string `json:"countryCode"`
+		City        string `json:"city"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.Status != "success" {
+		return "", ""
+	}
+
+	// 返回格式：IP, "国家代码 城市"
+	location := result.CountryCode
+	if result.City != "" {
+		location = fmt.Sprintf("%s %s", result.CountryCode, result.City)
+	}
+	
+	return result.Query, location
 }
 
 // ValidateAll 并发验证所有代理，返回验证结果
@@ -70,8 +103,8 @@ func (v *Validator) ValidateStream(proxies []storage.Proxy) <-chan Result {
 			go func(px storage.Proxy) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				valid, latency := v.ValidateOne(px)
-				ch <- Result{Proxy: px, Valid: valid, Latency: latency}
+				valid, latency, exitIP, exitLocation := v.ValidateOne(px)
+				ch <- Result{Proxy: px, Valid: valid, Latency: latency, ExitIP: exitIP, ExitLocation: exitLocation}
 			}(p)
 		}
 		wg.Wait()
@@ -81,8 +114,8 @@ func (v *Validator) ValidateStream(proxies []storage.Proxy) <-chan Result {
 	return ch
 }
 
-// ValidateOne 验证单个代理是否可用，返回是否有效和延迟
-func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration) {
+// ValidateOne 验证单个代理是否可用，返回是否有效、延迟、出口IP和地理位置
+func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, string) {
 	var client *http.Client
 	var err error
 
@@ -93,33 +126,50 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration) {
 		client, err = newSOCKS5Client(p.Address, v.timeout)
 	default:
 		log.Printf("unknown protocol %s for %s", p.Protocol, p.Address)
-		return false, 0
+		return false, 0, "", ""
 	}
 
 	if err != nil {
-		return false, 0
+		return false, 0, "", ""
 	}
 
 	start := time.Now()
 	resp, err := client.Get(v.validateURL)
 	latency := time.Since(start)
 	if err != nil {
-		return false, 0
+		return false, 0, "", ""
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 
 	// 验证状态码（200 或 204 都接受）
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return false, latency
+		return false, latency, "", ""
 	}
 
 	// 响应时间过滤
 	if v.maxResponseMs > 0 && latency > time.Duration(v.maxResponseMs)*time.Millisecond {
-		return false, latency
+		return false, latency, "", ""
 	}
 
-	return true, latency
+	// 获取出口 IP 和地理位置（仅在验证通过时）
+	exitIP, exitLocation := getExitIPInfo(client)
+	
+	// 必须能获取到出口信息
+	if exitIP == "" || exitLocation == "" {
+		return false, latency, exitIP, exitLocation
+	}
+	
+	// 过滤中国大陆出口（香港的countryCode是HK，不是CN）
+	if len(exitLocation) >= 2 {
+		countryCode := exitLocation[:2]
+		if countryCode == "CN" {
+			// 中国大陆出口，直接拒绝
+			return false, latency, exitIP, exitLocation
+		}
+	}
+
+	return true, latency, exitIP, exitLocation
 }
 
 func newHTTPClient(address string, timeout time.Duration) (*http.Client, error) {

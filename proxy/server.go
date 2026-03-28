@@ -10,25 +10,33 @@ import (
 	"time"
 
 	"golang.org/x/net/proxy"
-	"proxy-pool/config"
-	"proxy-pool/storage"
+	"goproxy/config"
+	"goproxy/storage"
 )
 
 type Server struct {
 	storage *storage.Storage
 	cfg     *config.Config
+	mode    string // "random" 或 "lowest-latency"
+	port    string
 }
 
-func New(s *storage.Storage, cfg *config.Config) *Server {
+func New(s *storage.Storage, cfg *config.Config, mode string, port string) *Server {
 	return &Server{
 		storage: s,
 		cfg:     cfg,
+		mode:    mode,
+		port:    port,
 	}
 }
 
 func (s *Server) Start() error {
-	log.Printf("proxy server listening on %s", s.cfg.ProxyPort)
-	return http.ListenAndServe(s.cfg.ProxyPort, s)
+	modeDesc := "随机轮换"
+	if s.mode == "lowest-latency" {
+		modeDesc = "最低延迟"
+	}
+	log.Printf("proxy server listening on %s [%s]", s.port, modeDesc)
+	return http.ListenAndServe(s.port, s)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -43,11 +51,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	var tried []string
 	for attempt := 0; attempt <= s.cfg.MaxRetry; attempt++ {
-		p, err := s.storage.GetRandomExclude(tried)
+		var p *storage.Proxy
+		var err error
+		
+		// 根据模式选择代理
+		if s.mode == "lowest-latency" {
+			p, err = s.storage.GetLowestLatencyExclude(tried)
+		} else {
+			p, err = s.storage.GetRandomExclude(tried)
+		}
+		
 		if err != nil {
 			http.Error(w, "no available proxy", http.StatusServiceUnavailable)
 			return
 		}
+		
+		tried = append(tried, p.Address)
 
 		client, err := s.buildClient(p)
 		if err != nil {
@@ -94,11 +113,22 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	var tried []string
 	for attempt := 0; attempt <= s.cfg.MaxRetry; attempt++ {
-		p, err := s.storage.GetRandomExclude(tried)
+		var p *storage.Proxy
+		var err error
+		
+		// 根据模式选择代理
+		if s.mode == "lowest-latency" {
+			p, err = s.storage.GetLowestLatencyExclude(tried)
+		} else {
+			p, err = s.storage.GetRandomExclude(tried)
+		}
+		
 		if err != nil {
 			http.Error(w, "no available proxy", http.StatusServiceUnavailable)
 			return
 		}
+		
+		tried = append(tried, p.Address)
 
 		conn, err := s.dialViaProxy(p, r.Host)
 		if err != nil {

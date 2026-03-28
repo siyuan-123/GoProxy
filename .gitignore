@@ -1,17 +1,41 @@
+# macOS
 .DS_Store
 
-# Build artifacts
+# Windows
+Thumbs.db
+
+# Go build artifacts
+goproxy
 proxy-pool
 *.exe
 *.out
+*.test
+vendor/
+
+# Test binaries
+test/test_proxy
+test/test_proxy.exe
 
 # Runtime data
 *.db
+*.db-shm
+*.db-wal
 *.log
 config.json
-data/*.db
-data/config.json
+data/
+!data/.gitkeep
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
 
 # IDE files
 .idea/
 .vscode/
+.cursor/
+*.iml
+
+# Docker volumes
+.docker-data/

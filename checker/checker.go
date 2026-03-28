@@ -4,9 +4,9 @@ import (
 	"log"
 	"time"
 
-	"proxy-pool/config"
-	"proxy-pool/storage"
-	"proxy-pool/validator"
+	"goproxy/config"
+	"goproxy/storage"
+	"goproxy/validator"
 )
 
 type Checker struct {
@@ -52,6 +52,19 @@ func (c *Checker) run() {
 	for _, r := range results {
 		if r.Valid {
 			valid++
+			// 更新出口 IP、位置和延迟信息
+			latencyMs := int(r.Latency.Milliseconds())
+			if r.ExitIP != "" && r.Proxy.ExitIP == "" {
+				// 如果之前没有出口 IP 信息，更新完整信息
+				if err := c.storage.UpdateExitInfo(r.Proxy.Address, r.ExitIP, r.ExitLocation, latencyMs); err != nil {
+					log.Printf("[checker] update exit info error: %v", err)
+				}
+			} else if r.Latency > 0 {
+				// 否则只更新延迟
+				if err := c.storage.UpdateLatency(r.Proxy.Address, latencyMs); err != nil {
+					log.Printf("[checker] update latency error: %v", err)
+				}
+			}
 		} else {
 			invalid++
 			if err := c.storage.Delete(r.Proxy.Address); err != nil {

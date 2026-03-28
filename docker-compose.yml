@@ -4,7 +4,8 @@ services:
     container_name: proxygo
     restart: unless-stopped
     ports:
-      - "127.0.0.1:7777:7777"   # HTTP 代理端口（仅内网）
+      - "127.0.0.1:7776:7776"   # 稳定代理端口（最低延迟）
+      - "127.0.0.1:7777:7777"   # 随机代理端口（轮换模式）
       - "7778:7778"               # WebUI 端口（外网可访问）
     volumes:
       - ./data:/app/data

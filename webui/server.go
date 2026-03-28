@@ -9,9 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"proxy-pool/config"
-	"proxy-pool/logger"
-	"proxy-pool/storage"
+	"goproxy/config"
+	"goproxy/logger"
+	"goproxy/pool"
+	"goproxy/storage"
+	"goproxy/validator"
 )
 
 // 简单内存 session
@@ -44,12 +46,19 @@ type FetchTrigger func()
 type Server struct {
 	storage       *storage.Storage
 	cfg           *config.Config
+	poolMgr       *pool.Manager
 	fetchTrigger  FetchTrigger
 	configChanged chan<- struct{}
 }
 
-func New(s *storage.Storage, cfg *config.Config, ft FetchTrigger, cc chan<- struct{}) *Server {
-	return &Server{storage: s, cfg: cfg, fetchTrigger: ft, configChanged: cc}
+func New(s *storage.Storage, cfg *config.Config, pm *pool.Manager, ft FetchTrigger, cc chan<- struct{}) *Server {
+	return &Server{
+		storage:       s,
+		cfg:           cfg,
+		poolMgr:       pm,
+		fetchTrigger:  ft,
+		configChanged: cc,
+	}
 }
 
 func (s *Server) Start() {
@@ -57,12 +66,22 @@ func (s *Server) Start() {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/login", s.handleLogin)
 	mux.HandleFunc("/logout", s.handleLogout)
-	mux.HandleFunc("/api/stats", s.authMiddleware(s.apiStats))
-	mux.HandleFunc("/api/proxies", s.authMiddleware(s.apiProxies))
+	
+	// 只读 API（访客可访问）
+	mux.HandleFunc("/api/stats", s.readOnlyMiddleware(s.apiStats))
+	mux.HandleFunc("/api/proxies", s.readOnlyMiddleware(s.apiProxies))
+	mux.HandleFunc("/api/logs", s.readOnlyMiddleware(s.apiLogs))
+	mux.HandleFunc("/api/pool/status", s.readOnlyMiddleware(s.apiPoolStatus))
+	mux.HandleFunc("/api/pool/quality", s.readOnlyMiddleware(s.apiQualityDistribution))
+	mux.HandleFunc("/api/config", s.readOnlyMiddleware(s.apiConfig))
+	mux.HandleFunc("/api/auth/check", s.apiAuthCheck) // 检查登录状态
+	
+	// 管理员 API（需要登录）
 	mux.HandleFunc("/api/proxy/delete", s.authMiddleware(s.apiDeleteProxy))
+	mux.HandleFunc("/api/proxy/refresh", s.authMiddleware(s.apiRefreshProxy))
 	mux.HandleFunc("/api/fetch", s.authMiddleware(s.apiFetch))
-	mux.HandleFunc("/api/logs", s.authMiddleware(s.apiLogs))
-	mux.HandleFunc("/api/config", s.authMiddleware(s.apiConfig))
+	mux.HandleFunc("/api/refresh-latency", s.authMiddleware(s.apiRefreshLatency))
+	mux.HandleFunc("/api/config/save", s.authMiddleware(s.apiConfigSave))
 
 	log.Printf("WebUI listening on %s", s.cfg.WebUIPort)
 	go func() {
@@ -72,6 +91,7 @@ func (s *Server) Start() {
 	}()
 }
 
+// authMiddleware 管理员权限中间件（必须登录）
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !validSession(r) {
@@ -86,11 +106,16 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if !validSession(r) {
-		http.Redirect(w, r, "/login", http.StatusFound)
-		return
+// readOnlyMiddleware 只读中间件（访客可访问，但会标记是否为管理员）
+func (s *Server) readOnlyMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 访客和管理员都可以访问，通过 validSession 判断权限
+		next(w, r)
 	}
+}
+
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	// 允许访客访问（只读模式），管理员登录后有完整权限
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, dashboardHTML)
 }
@@ -127,6 +152,20 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{Name: "session", Value: "", Path: "/", MaxAge: -1})
 	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+// apiAuthCheck 检查当前用户是否为管理员
+func (s *Server) apiAuthCheck(w http.ResponseWriter, r *http.Request) {
+	isAdmin := validSession(r)
+	jsonOK(w, map[string]interface{}{
+		"isAdmin": isAdmin,
+		"mode":    func() string {
+			if isAdmin {
+				return "admin"
+			}
+			return "guest"
+		}(),
+	})
 }
 
 func (s *Server) apiStats(w http.ResponseWriter, r *http.Request) {
@@ -173,6 +212,60 @@ func (s *Server) apiDeleteProxy(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"status": "deleted"})
 }
 
+func (s *Server) apiRefreshProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// 从数据库获取代理信息
+	proxies, err := s.storage.GetAll()
+	if err != nil {
+		jsonError(w, "failed to get proxy", http.StatusInternalServerError)
+		return
+	}
+	
+	var targetProxy *storage.Proxy
+	for i := range proxies {
+		if proxies[i].Address == req.Address {
+			targetProxy = &proxies[i]
+			break
+		}
+	}
+	
+	if targetProxy == nil {
+		jsonError(w, "proxy not found", http.StatusNotFound)
+		return
+	}
+
+	// 异步验证并更新
+	go func() {
+		cfg := config.Get()
+		v := validator.New(1, cfg.ValidateTimeout, cfg.ValidateURL)
+		
+		log.Printf("[webui] refreshing proxy: %s", req.Address)
+		valid, latency, exitIP, exitLocation := v.ValidateOne(*targetProxy)
+		
+		if valid {
+			latencyMs := int(latency.Milliseconds())
+			s.storage.UpdateExitInfo(req.Address, exitIP, exitLocation, latencyMs)
+			log.Printf("[webui] proxy refreshed: %s latency=%dms grade=%s", req.Address, latencyMs, storage.CalculateQualityGrade(latencyMs))
+		} else {
+			s.storage.Delete(req.Address)
+			log.Printf("[webui] proxy validation failed, removed: %s", req.Address)
+		}
+	}()
+
+	jsonOK(w, map[string]string{"status": "refresh started"})
+}
+
 func (s *Server) apiFetch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -182,52 +275,171 @@ func (s *Server) apiFetch(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"status": "fetch started"})
 }
 
-func (s *Server) apiLogs(w http.ResponseWriter, r *http.Request) {
-	lines := logger.GetLines(200)
-	jsonOK(w, map[string]interface{}{"lines": lines})
-}
-
-func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
-	cfg := config.Get()
-	if r.Method == http.MethodGet {
-		jsonOK(w, map[string]interface{}{
-			"fetch_interval":        cfg.FetchInterval,
-			"check_interval":        cfg.CheckInterval,
-			"validate_concurrency":  cfg.ValidateConcurrency,
-			"validate_timeout":      cfg.ValidateTimeout,
-		})
-		return
-	}
+func (s *Server) apiRefreshLatency(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var req struct {
-		FetchInterval       int `json:"fetch_interval"`
-		CheckInterval       int `json:"check_interval"`
-		ValidateConcurrency int `json:"validate_concurrency"`
-		ValidateTimeout     int `json:"validate_timeout"`
+	go func() {
+		log.Println("[webui] refreshing latency for all proxies...")
+		proxies, err := s.storage.GetAll()
+		if err != nil {
+			log.Printf("[webui] get proxies error: %v", err)
+			return
+		}
+		if len(proxies) == 0 {
+			log.Println("[webui] no proxies to refresh")
+			return
+		}
+
+		cfg := config.Get()
+		validate := validator.New(cfg.ValidateConcurrency, cfg.ValidateTimeout, cfg.ValidateURL)
+
+		log.Printf("[webui] refreshing latency for %d proxies...", len(proxies))
+		updated := 0
+		for r := range validate.ValidateStream(proxies) {
+			if r.Valid {
+				latencyMs := int(r.Latency.Milliseconds())
+				s.storage.UpdateExitInfo(r.Proxy.Address, r.ExitIP, r.ExitLocation, latencyMs)
+				updated++
+			} else {
+				s.storage.Delete(r.Proxy.Address)
+			}
+		}
+		log.Printf("[webui] latency refresh done: updated=%d", updated)
+	}()
+	jsonOK(w, map[string]string{"status": "refresh started"})
+}
+
+func (s *Server) apiLogs(w http.ResponseWriter, r *http.Request) {
+	lines := logger.GetLines(100)
+	jsonOK(w, map[string]interface{}{"lines": lines})
+}
+
+// apiConfig 获取配置
+func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	httpSlots, socks5Slots := cfg.CalculateSlots()
+	
+	jsonOK(w, map[string]interface{}{
+		// 池子配置
+		"pool_max_size":        cfg.PoolMaxSize,
+		"pool_http_ratio":      cfg.PoolHTTPRatio,
+		"pool_min_per_protocol": cfg.PoolMinPerProtocol,
+		"pool_http_slots":      httpSlots,
+		"pool_socks5_slots":    socks5Slots,
+		
+		// 延迟配置
+		"max_latency_ms":         cfg.MaxLatencyMs,
+		"max_latency_emergency":  cfg.MaxLatencyEmergency,
+		"max_latency_healthy":    cfg.MaxLatencyHealthy,
+		
+		// 验证配置
+		"validate_concurrency":   cfg.ValidateConcurrency,
+		"validate_timeout":       cfg.ValidateTimeout,
+		
+		// 健康检查配置
+		"health_check_interval":  cfg.HealthCheckInterval,
+		"health_check_batch_size": cfg.HealthCheckBatchSize,
+		
+		// 优化配置
+		"optimize_interval":      cfg.OptimizeInterval,
+		"replace_threshold":      cfg.ReplaceThreshold,
+	})
+}
+
+// apiConfigSave 保存配置
+func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
+
+	var req struct {
+		PoolMaxSize           int     `json:"pool_max_size"`
+		PoolHTTPRatio         float64 `json:"pool_http_ratio"`
+		PoolMinPerProtocol    int     `json:"pool_min_per_protocol"`
+		MaxLatencyMs          int     `json:"max_latency_ms"`
+		MaxLatencyEmergency   int     `json:"max_latency_emergency"`
+		MaxLatencyHealthy     int     `json:"max_latency_healthy"`
+		ValidateConcurrency   int     `json:"validate_concurrency"`
+		ValidateTimeout       int     `json:"validate_timeout"`
+		HealthCheckInterval   int     `json:"health_check_interval"`
+		HealthCheckBatchSize  int     `json:"health_check_batch_size"`
+		OptimizeInterval      int     `json:"optimize_interval"`
+		ReplaceThreshold      float64 `json:"replace_threshold"`
+	}
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	if req.FetchInterval <= 0 || req.CheckInterval <= 0 || req.ValidateConcurrency <= 0 || req.ValidateTimeout <= 0 {
-		jsonError(w, "all values must be positive", http.StatusBadRequest)
+
+	// 验证配置有效性
+	if req.PoolMaxSize <= 0 || req.PoolHTTPRatio <= 0 || req.PoolHTTPRatio > 1 {
+		jsonError(w, "invalid pool config", http.StatusBadRequest)
 		return
 	}
-	if err := config.Save(req.FetchInterval, req.CheckInterval, req.ValidateConcurrency, req.ValidateTimeout); err != nil {
+
+	// 记录旧配置
+	oldCfg := config.Get()
+	oldSize := oldCfg.PoolMaxSize
+	oldRatio := oldCfg.PoolHTTPRatio
+
+	// 更新配置
+	newCfg := *oldCfg
+	newCfg.PoolMaxSize = req.PoolMaxSize
+	newCfg.PoolHTTPRatio = req.PoolHTTPRatio
+	newCfg.PoolMinPerProtocol = req.PoolMinPerProtocol
+	newCfg.MaxLatencyMs = req.MaxLatencyMs
+	newCfg.MaxLatencyEmergency = req.MaxLatencyEmergency
+	newCfg.MaxLatencyHealthy = req.MaxLatencyHealthy
+	newCfg.ValidateConcurrency = req.ValidateConcurrency
+	newCfg.ValidateTimeout = req.ValidateTimeout
+	newCfg.HealthCheckInterval = req.HealthCheckInterval
+	newCfg.HealthCheckBatchSize = req.HealthCheckBatchSize
+	newCfg.OptimizeInterval = req.OptimizeInterval
+	newCfg.ReplaceThreshold = req.ReplaceThreshold
+
+	if err := config.Save(&newCfg); err != nil {
 		jsonError(w, "save config error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// 通知定时器重置
+
+	// 通知配置变更
 	select {
 	case s.configChanged <- struct{}{}:
 	default:
 	}
-	log.Printf("[config] updated: fetch=%dm check=%dm concurrency=%d timeout=%ds",
-		req.FetchInterval, req.CheckInterval, req.ValidateConcurrency, req.ValidateTimeout)
+
+	// 如果池子大小或比例变更，调整池子
+	if oldSize != req.PoolMaxSize || oldRatio != req.PoolHTTPRatio {
+		go s.poolMgr.AdjustForConfigChange(oldSize, oldRatio)
+	}
+
+	log.Printf("[config] 配置已更新: 池子=%d HTTP=%.0f%% 延迟=%dms",
+		req.PoolMaxSize, req.PoolHTTPRatio*100, req.MaxLatencyMs)
 	jsonOK(w, map[string]string{"status": "saved"})
+}
+
+// apiPoolStatus 获取池子状态
+func (s *Server) apiPoolStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := s.poolMgr.GetStatus()
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, status)
+}
+
+// apiQualityDistribution 获取质量分布
+func (s *Server) apiQualityDistribution(w http.ResponseWriter, r *http.Request) {
+	dist, err := s.storage.GetQualityDistribution()
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, dist)
 }
 
 func jsonOK(w http.ResponseWriter, data interface{}) {

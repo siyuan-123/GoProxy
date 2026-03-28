@@ -25,8 +25,8 @@ type writer struct{}
 
 func (w *writer) Write(p []byte) (n int, err error) {
 	line := strings.TrimRight(string(p), "\n")
-	ts := time.Now().Format("2006/01/02 15:04:05")
-	formatted := fmt.Sprintf("%s %s", ts, line)
+	ts := time.Now().Format("15:04:05")
+	formatted := fmt.Sprintf("[%s] %s", ts, line)
 
 	mu.Lock()
 	lines = append(lines, formatted)
