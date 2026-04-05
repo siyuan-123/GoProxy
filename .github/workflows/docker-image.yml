@@ -11,7 +11,7 @@ on:
 env:
   REGISTRY_DOCKERHUB: docker.io
   REGISTRY_GHCR: ghcr.io
-  IMAGE_NAME: isboyjc/goproxy
+  IMAGE_NAME: siyuan-123/goproxy
 
 jobs:
   build-and-push:
