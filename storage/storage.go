@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -341,6 +342,76 @@ func scanProxy(rows *sql.Rows) (*Proxy, error) {
 	return p, nil
 }
 
+func qualityRank(grade string) int {
+	switch grade {
+	case "S":
+		return 0
+	case "A":
+		return 1
+	case "B":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func filterByMaxQualityRank(proxies []Proxy, maxRank int) []Proxy {
+	filtered := make([]Proxy, 0, len(proxies))
+	for _, p := range proxies {
+		if qualityRank(p.QualityGrade) <= maxRank {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered
+}
+
+func selectRotationCandidates(proxies []Proxy) []Proxy {
+	if len(proxies) <= 1 {
+		return proxies
+	}
+
+	candidates := proxies
+	if best := filterByMaxQualityRank(proxies, 1); len(best) >= 6 {
+		candidates = best
+	} else if usable := filterByMaxQualityRank(proxies, 2); len(usable) >= 4 {
+		candidates = usable
+	}
+
+	// Keep the fast half of the pool, capped, so rotation stays diverse but not noisy.
+	latencyWindow := len(candidates) / 2
+	if latencyWindow < 6 {
+		latencyWindow = len(candidates)
+	}
+	if latencyWindow > 24 {
+		latencyWindow = 24
+	}
+	candidates = append([]Proxy(nil), candidates[:latencyWindow]...)
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		iUnused := candidates[i].LastUsed.IsZero()
+		jUnused := candidates[j].LastUsed.IsZero()
+		if iUnused != jUnused {
+			return iUnused
+		}
+		if !candidates[i].LastUsed.Equal(candidates[j].LastUsed) {
+			return candidates[i].LastUsed.Before(candidates[j].LastUsed)
+		}
+		if candidates[i].UseCount != candidates[j].UseCount {
+			return candidates[i].UseCount < candidates[j].UseCount
+		}
+		if qualityRank(candidates[i].QualityGrade) != qualityRank(candidates[j].QualityGrade) {
+			return qualityRank(candidates[i].QualityGrade) < qualityRank(candidates[j].QualityGrade)
+		}
+		return candidates[i].Latency < candidates[j].Latency
+	})
+
+	if len(candidates) > 8 {
+		candidates = candidates[:8]
+	}
+
+	return candidates
+}
+
 // GetAll 获取所有可用代理
 func (s *Storage) GetAll() ([]Proxy, error) {
 	return s.GetAllFiltered("")
@@ -407,6 +478,7 @@ func (s *Storage) GetRandomExcludeFiltered(excludes []string, sourceFilter strin
 		return s.GetRandom()
 	}
 
+	available = selectRotationCandidates(available)
 	p := available[rand.Intn(len(available))]
 	return &p, nil
 }
@@ -466,7 +538,8 @@ func (s *Storage) GetRandomByProtocolExcludeFiltered(protocol string, excludes [
 		return nil, fmt.Errorf("no %s proxy available", protocol)
 	}
 
-	proxy := available[time.Now().UnixNano()%int64(len(available))]
+	available = selectRotationCandidates(available)
+	proxy := available[rand.Intn(len(available))]
 	return &proxy, nil
 }
 

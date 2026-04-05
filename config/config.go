@@ -260,8 +260,8 @@ func Load() *Config {
 			if saved.PoolHTTPRatio > 0 && saved.PoolHTTPRatio <= 1 {
 				cfg.PoolHTTPRatio = saved.PoolHTTPRatio
 			}
-			if saved.PoolMinPerProtocol > 0 {
-				cfg.PoolMinPerProtocol = saved.PoolMinPerProtocol
+			if saved.PoolMinPerProtocol != nil && *saved.PoolMinPerProtocol >= 0 {
+				cfg.PoolMinPerProtocol = *saved.PoolMinPerProtocol
 			}
 
 			// 延迟配置
@@ -355,9 +355,9 @@ func Get() *Config {
 // savedConfig 持久化可调整的字段
 type savedConfig struct {
 	// 池子配置
-	PoolMaxSize        int     `json:"pool_max_size"`
-	PoolHTTPRatio      float64 `json:"pool_http_ratio"`
-	PoolMinPerProtocol int     `json:"pool_min_per_protocol"`
+	PoolMaxSize        int      `json:"pool_max_size"`
+	PoolHTTPRatio      float64  `json:"pool_http_ratio"`
+	PoolMinPerProtocol *int     `json:"pool_min_per_protocol"`
 
 	// 延迟配置
 	MaxLatencyMs        int `json:"max_latency_ms"`
@@ -402,10 +402,11 @@ func Save(cfg *Config) error {
 
 	customPriority := cfg.CustomPriority
 	customFreePriority := cfg.CustomFreePriority
+	poolMinPerProtocol := cfg.PoolMinPerProtocol
 	data, err := json.MarshalIndent(savedConfig{
 		PoolMaxSize:           cfg.PoolMaxSize,
 		PoolHTTPRatio:         cfg.PoolHTTPRatio,
-		PoolMinPerProtocol:    cfg.PoolMinPerProtocol,
+		PoolMinPerProtocol:    &poolMinPerProtocol,
 		MaxLatencyMs:          cfg.MaxLatencyMs,
 		MaxLatencyEmergency:   cfg.MaxLatencyEmergency,
 		MaxLatencyHealthy:     cfg.MaxLatencyHealthy,

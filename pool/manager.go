@@ -66,9 +66,14 @@ func (m *Manager) GetStatus() (*PoolStatus, error) {
 // determineState 判断池子状态
 func (m *Manager) determineState(total, httpCount, socks5Count int) string {
 	httpSlots, socks5Slots := m.cfg.CalculateSlots()
+	needHTTP := httpSlots > 0
+	needSOCKS5 := socks5Slots > 0
 
 	// 单协议缺失
-	if httpCount == 0 || socks5Count == 0 {
+	if needHTTP && httpCount == 0 {
+		return "emergency"
+	}
+	if needSOCKS5 && socks5Count == 0 {
 		return "emergency"
 	}
 
@@ -79,7 +84,9 @@ func (m *Manager) determineState(total, httpCount, socks5Count int) string {
 	}
 
 	// 危急：任一协议<20%槽位
-	if httpCount < int(float64(httpSlots)*0.2) || socks5Count < int(float64(socks5Slots)*0.2) {
+	httpCritical := needHTTP && httpCount < int(float64(httpSlots)*0.2)
+	socks5Critical := needSOCKS5 && socks5Count < int(float64(socks5Slots)*0.2)
+	if httpCritical || socks5Critical {
 		return "critical"
 	}
 
@@ -95,11 +102,14 @@ func (m *Manager) determineState(total, httpCount, socks5Count int) string {
 
 // NeedsFetch 判断是否需要抓取以及抓取模式
 func (m *Manager) NeedsFetch(status *PoolStatus) (bool, string, string) {
+	requireHTTP := status.HTTPSlots > 0
+	requireSOCKS5 := status.SOCKS5Slots > 0
+
 	// 单协议缺失：紧急模式，指定协议
-	if status.HTTP == 0 {
+	if requireHTTP && status.HTTP == 0 {
 		return true, "emergency", "http"
 	}
-	if status.SOCKS5 == 0 {
+	if requireSOCKS5 && status.SOCKS5 == 0 {
 		return true, "emergency", "socks5"
 	}
 
@@ -111,18 +121,24 @@ func (m *Manager) NeedsFetch(status *PoolStatus) (bool, string, string) {
 	// 危急或警告：补充模式
 	if status.State == "critical" || status.State == "warning" {
 		// 判断哪个协议更缺
-		httpPct := float64(status.HTTP) / float64(status.HTTPSlots)
-		socks5Pct := float64(status.SOCKS5) / float64(status.SOCKS5Slots)
+		httpPct := 1.0
+		socks5Pct := 1.0
+		if requireHTTP {
+			httpPct = float64(status.HTTP) / float64(status.HTTPSlots)
+		}
+		if requireSOCKS5 {
+			socks5Pct = float64(status.SOCKS5) / float64(status.SOCKS5Slots)
+		}
 
 		// 如果两个协议都缺（都<50%），同时补充两个协议
-		if httpPct < 0.5 && socks5Pct < 0.5 {
+		if requireHTTP && requireSOCKS5 && httpPct < 0.5 && socks5Pct < 0.5 {
 			return true, "refill", ""
 		}
 		// 只有一个协议缺时，优先补充更缺的
-		if httpPct < 0.5 {
+		if requireHTTP && httpPct < 0.5 {
 			return true, "refill", "http"
 		}
-		if socks5Pct < 0.5 {
+		if requireSOCKS5 && socks5Pct < 0.5 {
 			return true, "refill", "socks5"
 		}
 		return true, "refill", ""
