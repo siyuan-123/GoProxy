@@ -56,7 +56,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	
+
 	if r.Method == http.MethodConnect {
 		s.handleTunnel(w, r)
 	} else {
@@ -70,31 +70,31 @@ func (s *Server) checkAuth(r *http.Request) bool {
 	if auth == "" {
 		return false
 	}
-	
+
 	// 解析 Basic Auth
 	const prefix = "Basic "
 	if !strings.HasPrefix(auth, prefix) {
 		return false
 	}
-	
+
 	decoded, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
 	if err != nil {
 		return false
 	}
-	
+
 	credentials := strings.SplitN(string(decoded), ":", 2)
 	if len(credentials) != 2 {
 		return false
 	}
-	
+
 	username := credentials[0]
 	password := credentials[1]
-	
+
 	// 验证用户名和密码
 	usernameMatch := subtle.ConstantTimeCompare([]byte(username), []byte(s.cfg.ProxyAuthUsername)) == 1
 	passwordHash := fmt.Sprintf("%x", sha256.Sum256([]byte(password)))
 	passwordMatch := subtle.ConstantTimeCompare([]byte(passwordHash), []byte(s.cfg.ProxyAuthPasswordHash)) == 1
-	
+
 	return usernameMatch && passwordMatch
 }
 
@@ -259,23 +259,7 @@ func (s *Server) dialViaProxy(p *storage.Proxy, host string) (net.Conn, error) {
 	timeout := time.Duration(s.cfg.ValidateTimeout) * time.Second
 	switch p.Protocol {
 	case "http":
-		conn, err := net.DialTimeout("tcp", p.Address, timeout)
-		if err != nil {
-			return nil, err
-		}
-		// 发送 CONNECT 请求给上游 HTTP 代理
-		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", host, host)
-		buf := make([]byte, 256)
-		n, err := conn.Read(buf)
-		if err != nil {
-			conn.Close()
-			return nil, err
-		}
-		if n < 12 {
-			conn.Close()
-			return nil, fmt.Errorf("short response from proxy")
-		}
-		return conn, nil
+		return dialHTTPConnect(p.Address, host, timeout)
 	case "socks5":
 		dialer, err := proxy.SOCKS5("tcp", p.Address, nil, proxy.Direct)
 		if err != nil {

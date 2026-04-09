@@ -13,22 +13,22 @@ import (
 )
 
 type Proxy struct {
-	ID           int64     `json:"id"`
-	Address      string    `json:"address"`
-	Protocol     string    `json:"protocol"`
-	ExitIP       string    `json:"exit_ip"`
-	ExitLocation string    `json:"exit_location"`
-	Latency      int       `json:"latency"`
-	QualityGrade string    `json:"quality_grade"`
-	UseCount     int       `json:"use_count"`
-	SuccessCount int       `json:"success_count"`
-	FailCount    int       `json:"fail_count"`
-	LastUsed     time.Time `json:"last_used"`
-	LastCheck    time.Time `json:"last_check"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID             int64     `json:"id"`
+	Address        string    `json:"address"`
+	Protocol       string    `json:"protocol"`
+	ExitIP         string    `json:"exit_ip"`
+	ExitLocation   string    `json:"exit_location"`
+	Latency        int       `json:"latency"`
+	QualityGrade   string    `json:"quality_grade"`
+	UseCount       int       `json:"use_count"`
+	SuccessCount   int       `json:"success_count"`
+	FailCount      int       `json:"fail_count"`
+	LastUsed       time.Time `json:"last_used"`
+	LastCheck      time.Time `json:"last_check"`
+	CreatedAt      time.Time `json:"created_at"`
 	Status         string    `json:"status"`
 	Source         string    `json:"source"`          // "free" 或 "custom"
-	SubscriptionID int64    `json:"subscription_id"` // 所属订阅ID（0=免费代理）
+	SubscriptionID int64     `json:"subscription_id"` // 所属订阅ID（0=免费代理）
 }
 
 // Subscription 订阅信息
@@ -56,7 +56,7 @@ type SourceStatus struct {
 	ConsecutiveFails int
 	LastSuccess      time.Time
 	LastFail         time.Time
-	Status           string    // active/degraded/disabled
+	Status           string // active/degraded/disabled
 	DisabledUntil    time.Time
 }
 
@@ -253,7 +253,7 @@ func (s *Storage) AddProxy(address, protocol string) error {
 		log.Printf("[storage] AddProxy %s error: %v", address, err)
 		return err
 	}
-	
+
 	// 检查是否真的插入了
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
@@ -286,7 +286,7 @@ func (s *Storage) AddProxies(proxies []Proxy) error {
 // GetRandom 随机取一个可用代理（优先选择质量高的）
 func (s *Storage) GetRandom() (*Proxy, error) {
 	rows, err := s.db.Query(
-		`SELECT `+proxyColumns+`
+		`SELECT ` + proxyColumns + `
 		 FROM proxies
 		 WHERE status = 'active' AND fail_count < 3
 		 ORDER BY
@@ -388,6 +388,15 @@ func selectRotationCandidates(proxies []Proxy) []Proxy {
 	candidates = append([]Proxy(nil), candidates[:latencyWindow]...)
 
 	sort.SliceStable(candidates, func(i, j int) bool {
+		if qualityRank(candidates[i].QualityGrade) != qualityRank(candidates[j].QualityGrade) {
+			return qualityRank(candidates[i].QualityGrade) < qualityRank(candidates[j].QualityGrade)
+		}
+		if candidates[i].FailCount != candidates[j].FailCount {
+			return candidates[i].FailCount < candidates[j].FailCount
+		}
+		if candidates[i].Latency != candidates[j].Latency {
+			return candidates[i].Latency < candidates[j].Latency
+		}
 		iUnused := candidates[i].LastUsed.IsZero()
 		jUnused := candidates[j].LastUsed.IsZero()
 		if iUnused != jUnused {
@@ -396,13 +405,7 @@ func selectRotationCandidates(proxies []Proxy) []Proxy {
 		if !candidates[i].LastUsed.Equal(candidates[j].LastUsed) {
 			return candidates[i].LastUsed.Before(candidates[j].LastUsed)
 		}
-		if candidates[i].UseCount != candidates[j].UseCount {
-			return candidates[i].UseCount < candidates[j].UseCount
-		}
-		if qualityRank(candidates[i].QualityGrade) != qualityRank(candidates[j].QualityGrade) {
-			return qualityRank(candidates[i].QualityGrade) < qualityRank(candidates[j].QualityGrade)
-		}
-		return candidates[i].Latency < candidates[j].Latency
+		return candidates[i].UseCount < candidates[j].UseCount
 	})
 
 	if len(candidates) > 8 {
@@ -1006,7 +1009,7 @@ func (s *Storage) EnableProxy(address string) error {
 // GetDisabledCustomProxies 获取所有被禁用的订阅代理
 func (s *Storage) GetDisabledCustomProxies() ([]Proxy, error) {
 	rows, err := s.db.Query(
-		`SELECT `+proxyColumns+`
+		`SELECT ` + proxyColumns + `
 		 FROM proxies
 		 WHERE source = 'custom' AND status = 'disabled'`,
 	)
@@ -1169,7 +1172,7 @@ func (s *Storage) GetSubscriptions() ([]Subscription, error) {
 // GetSubscription 获取单个订阅
 func (s *Storage) GetSubscription(id int64) (*Subscription, error) {
 	rows, err := s.db.Query(
-		`SELECT ` + subColumns + `
+		`SELECT `+subColumns+`
 		 FROM subscriptions WHERE id = ?`, id,
 	)
 	if err != nil {

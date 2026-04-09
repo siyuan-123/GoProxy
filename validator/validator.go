@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +54,16 @@ type Result struct {
 	ExitLocation string
 }
 
+var defaultHTTPSTestTargets = []string{
+	"https://q.us-east-1.amazonaws.com/",
+	"https://oidc.us-east-1.amazonaws.com/token",
+}
+
+var defaultHTTPSProbeHosts = map[string]struct{}{
+	"q.us-east-1.amazonaws.com":    {},
+	"oidc.us-east-1.amazonaws.com": {},
+}
+
 // getExitIPInfo 通过代理获取出口 IP 和地理位置
 func getExitIPInfo(client *http.Client) (string, string) {
 	// 使用 ip-api.com 返回 JSON 格式的 IP 信息
@@ -64,7 +75,7 @@ func getExitIPInfo(client *http.Client) (string, string) {
 
 	var result struct {
 		Status      string `json:"status"`
-		Query       string `json:"query"`       // IP 地址
+		Query       string `json:"query"` // IP 地址
 		Country     string `json:"country"`
 		CountryCode string `json:"countryCode"`
 		City        string `json:"city"`
@@ -79,54 +90,82 @@ func getExitIPInfo(client *http.Client) (string, string) {
 	if result.City != "" {
 		location = fmt.Sprintf("%s %s", result.CountryCode, result.City)
 	}
-	
+
 	return result.Query, location
 }
 
-// HTTPS 测试目标列表，随机选一个验证代理的 CONNECT 隧道能力
-var httpsTestTargets = []string{
-	"https://www.google.com",
-	"https://www.openai.com",
-	"https://www.github.com",
-	"https://www.cloudflare.com",
-	"https://httpbin.org/ip",
+func (v *Validator) httpsTestTargets() []string {
+	if v.cfg != nil && len(v.cfg.HTTPSTestTargets) > 0 {
+		return v.cfg.HTTPSTestTargets
+	}
+	return defaultHTTPSTestTargets
 }
 
-// checkHTTPSConnect 通过 HTTP 代理实际访问一个随机 HTTPS 网站，验证 CONNECT 隧道是否可用
-// 首次失败会换一个目标重试一次，避免目标网站偶尔抽风导致误杀
-func checkHTTPSConnect(proxyAddr string, timeout time.Duration) bool {
-	proxyURL, err := url.Parse(fmt.Sprintf("http://%s", proxyAddr))
-	if err != nil {
-		return false
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			Proxy:               http.ProxyURL(proxyURL),
-			TLSHandshakeTimeout: timeout,
-		},
-		Timeout: timeout,
+// checkHTTPSReachability 通过已构建好的代理客户端访问真实 HTTPS 目标，
+// 用于筛掉“能访问验证 URL，但对 AWS/Kiro 上游不稳定”的代理。
+// 首次失败会换一个目标重试一次，避免单个站点偶发抖动导致误杀。
+func checkHTTPSReachability(client *http.Client, targets []string) bool {
+	if len(targets) == 0 {
+		targets = defaultHTTPSTestTargets
 	}
 
 	// 随机起始索引
-	start := int(time.Now().UnixNano() % int64(len(httpsTestTargets)))
+	start := int(time.Now().UnixNano() % int64(len(targets)))
 
 	for attempt := 0; attempt < 2; attempt++ {
-		idx := (start + attempt) % len(httpsTestTargets)
-		resp, err := client.Get(httpsTestTargets[idx])
+		idx := (start + attempt) % len(targets)
+		req, err := http.NewRequest(http.MethodHead, targets[idx], nil)
+		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			continue
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
-		// 2xx 或 3xx 都算成功（部分网站会重定向）
-		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		if isExpectedHTTPSProbeResponse(targets[idx], resp) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func isExpectedHTTPSProbeResponse(target string, resp *http.Response) bool {
+	if resp.StatusCode == http.StatusProxyAuthRequired {
+		return false
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		return true
+	}
+
+	if resp.StatusCode == http.StatusMethodNotAllowed {
+		return true
+	}
+
+	if !isDefaultAWSProbeTarget(target) {
+		return false
+	}
+
+	switch resp.StatusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests:
+		return resp.Header.Get("x-amzn-requestid") != ""
+	default:
+		return false
+	}
+}
+
+func isDefaultAWSProbeTarget(target string) bool {
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	_, ok := defaultHTTPSProbeHosts[host]
+	return ok
 }
 
 // ValidateAll 并发验证所有代理，返回验证结果
@@ -202,12 +241,12 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 
 	// 获取出口 IP 和地理位置（仅在验证通过时）
 	exitIP, exitLocation := getExitIPInfo(client)
-	
+
 	// 必须能获取到出口信息
 	if exitIP == "" || exitLocation == "" {
 		return false, latency, exitIP, exitLocation
 	}
-	
+
 	// 地理过滤：白名单优先，否则走黑名单
 	if v.cfg != nil && len(exitLocation) >= 2 {
 		countryCode := exitLocation[:2]
@@ -233,11 +272,9 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 		}
 	}
 
-	// HTTP 代理额外检测：必须支持 HTTPS CONNECT 隧道
-	if p.Protocol == "http" {
-		if !checkHTTPSConnect(p.Address, v.timeout) {
-			return false, latency, exitIP, exitLocation
-		}
+	// 所有代理都额外检测 Kiro/AWS 真实 HTTPS 目标，避免只对 gstatic 快、对 AWS 慢。
+	if !checkHTTPSReachability(client, v.httpsTestTargets()) {
+		return false, latency, exitIP, exitLocation
 	}
 
 	return true, latency, exitIP, exitLocation
