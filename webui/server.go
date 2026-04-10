@@ -276,11 +276,14 @@ func (s *Server) apiRefreshProxy(w http.ResponseWriter, r *http.Request) {
 		v := validator.New(1, cfg.ValidateTimeout, cfg.ValidateURL)
 		
 		log.Printf("[webui] refreshing proxy: %s", req.Address)
-		valid, latency, exitIP, exitLocation := v.ValidateOne(*targetProxy)
+		valid, latency, exitIP, exitLocation, httpsLatency := v.ValidateOne(*targetProxy)
 		
 		if valid {
 			latencyMs := int(latency.Milliseconds())
 			s.storage.UpdateExitInfo(req.Address, exitIP, exitLocation, latencyMs)
+			if httpsLatency > 0 {
+				s.storage.UpdateKiroValidation(req.Address, int(httpsLatency.Milliseconds()))
+			}
 			log.Printf("[webui] proxy refreshed: %s latency=%dms grade=%s", req.Address, latencyMs, storage.CalculateQualityGrade(latencyMs))
 		} else {
 			if targetProxy.Source == "custom" {
@@ -331,6 +334,9 @@ func (s *Server) apiRefreshLatency(w http.ResponseWriter, r *http.Request) {
 			if r.Valid {
 				latencyMs := int(r.Latency.Milliseconds())
 				s.storage.UpdateExitInfo(r.Proxy.Address, r.ExitIP, r.ExitLocation, latencyMs)
+				if r.HTTPSLatency > 0 {
+					s.storage.UpdateKiroValidation(r.Proxy.Address, int(r.HTTPSLatency.Milliseconds()))
+				}
 				updated++
 			} else {
 				if r.Proxy.Source == "custom" {
@@ -519,7 +525,7 @@ func (s *Server) apiQualityDistribution(w http.ResponseWriter, r *http.Request) 
 
 // ========== 订阅管理 API ==========
 
-// apiSubscriptions 获取订阅列表（含每个订阅的可用/不可用代理数）
+// apiSubscriptions 获取订阅列表（含每个订阅的可用/不可用代理数，不返回敏感字段）
 func (s *Server) apiSubscriptions(w http.ResponseWriter, r *http.Request) {
 	subs, err := s.storage.GetSubscriptions()
 	if err != nil {
@@ -530,17 +536,34 @@ func (s *Server) apiSubscriptions(w http.ResponseWriter, r *http.Request) {
 		subs = []storage.Subscription{}
 	}
 
-	// 附加每个订阅的代理统计
-	type subWithStats struct {
-		storage.Subscription
-		ActiveCount   int `json:"active_count"`
-		DisabledCount int `json:"disabled_count"`
+	type safeSubWithStats struct {
+		ID            int64     `json:"id"`
+		Name          string    `json:"name"`
+		Format        string    `json:"format"`
+		RefreshMin    int       `json:"refresh_min"`
+		LastFetch     time.Time `json:"last_fetch"`
+		LastSuccess   time.Time `json:"last_success"`
+		Status        string    `json:"status"`
+		ProxyCount    int       `json:"proxy_count"`
+		CreatedAt     time.Time `json:"created_at"`
+		Contributed   bool      `json:"contributed"`
+		ActiveCount   int       `json:"active_count"`
+		DisabledCount int       `json:"disabled_count"`
 	}
-	var result []subWithStats
+	var result []safeSubWithStats
 	for _, sub := range subs {
 		active, disabled := s.storage.CountBySubscriptionID(sub.ID)
-		result = append(result, subWithStats{
-			Subscription:  sub,
+		result = append(result, safeSubWithStats{
+			ID:            sub.ID,
+			Name:          sub.Name,
+			Format:        sub.Format,
+			RefreshMin:    sub.RefreshMin,
+			LastFetch:     sub.LastFetch,
+			LastSuccess:   sub.LastSuccess,
+			Status:        sub.Status,
+			ProxyCount:    sub.ProxyCount,
+			CreatedAt:     sub.CreatedAt,
+			Contributed:   sub.Contributed,
 			ActiveCount:   active,
 			DisabledCount: disabled,
 		})

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,22 +13,26 @@ import (
 )
 
 type Proxy struct {
-	ID           int64     `json:"id"`
-	Address      string    `json:"address"`
-	Protocol     string    `json:"protocol"`
-	ExitIP       string    `json:"exit_ip"`
-	ExitLocation string    `json:"exit_location"`
-	Latency      int       `json:"latency"`
-	QualityGrade string    `json:"quality_grade"`
-	UseCount     int       `json:"use_count"`
-	SuccessCount int       `json:"success_count"`
-	FailCount    int       `json:"fail_count"`
-	LastUsed     time.Time `json:"last_used"`
-	LastCheck    time.Time `json:"last_check"`
-	CreatedAt    time.Time `json:"created_at"`
-	Status         string    `json:"status"`
-	Source         string    `json:"source"`          // "free" 或 "custom"
-	SubscriptionID int64    `json:"subscription_id"` // 所属订阅ID（0=免费代理）
+	ID               int64     `json:"id"`
+	Address          string    `json:"address"`
+	Protocol         string    `json:"protocol"`
+	ExitIP           string    `json:"exit_ip"`
+	ExitLocation     string    `json:"exit_location"`
+	Latency          int       `json:"latency"`
+	QualityGrade     string    `json:"quality_grade"`
+	UseCount         int       `json:"use_count"`
+	SuccessCount     int       `json:"success_count"`
+	FailCount        int       `json:"fail_count"`
+	LastUsed         time.Time `json:"last_used"`
+	LastCheck        time.Time `json:"last_check"`
+	CreatedAt        time.Time `json:"created_at"`
+	Status           string    `json:"status"`
+	Source           string    `json:"source"`            // "free" 或 "custom"
+	SubscriptionID   int64     `json:"subscription_id"`   // 所属订阅ID（0=免费代理）
+	KiroValidated    bool      `json:"kiro_validated"`    // 是否通过 Kiro/AWS HTTPS 延迟测试
+	KiroLatency      int       `json:"kiro_latency"`      // Kiro HTTPS 探测延迟（ms）
+	AvgServeLatency  int       `json:"avg_serve_latency"` // 实际使用的平均建连延迟（ms）
+	ConsecutiveFails int       `json:"consecutive_fails"` // 连续失败次数（成功后重置）
 }
 
 // Subscription 订阅信息
@@ -55,7 +60,7 @@ type SourceStatus struct {
 	ConsecutiveFails int
 	LastSuccess      time.Time
 	LastFail         time.Time
-	Status           string    // active/degraded/disabled
+	Status           string // active/degraded/disabled
 	DisabledUntil    time.Time
 }
 
@@ -227,6 +232,17 @@ func (s *Storage) initSchema() error {
 		return err
 	}
 
+	// 迁移：添加 kiro_validated / kiro_latency / avg_serve_latency / consecutive_fails 字段
+	var hasKiroValidated int
+	s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('proxies') WHERE name='kiro_validated'`).Scan(&hasKiroValidated)
+	if hasKiroValidated == 0 {
+		log.Println("[storage] migrating: adding kiro/serve latency tracking columns")
+		s.db.Exec(`ALTER TABLE proxies ADD COLUMN kiro_validated INTEGER NOT NULL DEFAULT 0`)
+		s.db.Exec(`ALTER TABLE proxies ADD COLUMN kiro_latency INTEGER NOT NULL DEFAULT 0`)
+		s.db.Exec(`ALTER TABLE proxies ADD COLUMN avg_serve_latency INTEGER NOT NULL DEFAULT 0`)
+		s.db.Exec(`ALTER TABLE proxies ADD COLUMN consecutive_fails INTEGER NOT NULL DEFAULT 0`)
+	}
+
 	// 迁移：订阅表添加 contributed 和 last_success 字段
 	var hasContributed int
 	s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('subscriptions') WHERE name='contributed'`).Scan(&hasContributed)
@@ -252,7 +268,7 @@ func (s *Storage) AddProxy(address, protocol string) error {
 		log.Printf("[storage] AddProxy %s error: %v", address, err)
 		return err
 	}
-	
+
 	// 检查是否真的插入了
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
@@ -285,7 +301,7 @@ func (s *Storage) AddProxies(proxies []Proxy) error {
 // GetRandom 随机取一个可用代理（优先选择质量高的）
 func (s *Storage) GetRandom() (*Proxy, error) {
 	rows, err := s.db.Query(
-		`SELECT `+proxyColumns+`
+		`SELECT ` + proxyColumns + `
 		 FROM proxies
 		 WHERE status = 'active' AND fail_count < 3
 		 ORDER BY
@@ -311,7 +327,8 @@ func (s *Storage) GetRandom() (*Proxy, error) {
 
 // proxyColumns 代理表查询的标准列列表
 const proxyColumns = `id, address, protocol, exit_ip, exit_location, latency, quality_grade,
-	use_count, success_count, fail_count, last_used, last_check, created_at, status, source, subscription_id`
+	use_count, success_count, fail_count, last_used, last_check, created_at, status, source, subscription_id,
+	kiro_validated, kiro_latency, avg_serve_latency, consecutive_fails`
 
 // scanProxy 扫描代理行数据
 func scanProxy(rows *sql.Rows) (*Proxy, error) {
@@ -319,9 +336,12 @@ func scanProxy(rows *sql.Rows) (*Proxy, error) {
 	var lastUsed, lastCheck sql.NullTime
 	var source sql.NullString
 	var subID sql.NullInt64
+	var kiroValidated sql.NullInt64
+	var kiroLatency, avgServeLatency, consecutiveFails sql.NullInt64
 	if err := rows.Scan(&p.ID, &p.Address, &p.Protocol, &p.ExitIP, &p.ExitLocation,
 		&p.Latency, &p.QualityGrade, &p.UseCount, &p.SuccessCount, &p.FailCount,
-		&lastUsed, &lastCheck, &p.CreatedAt, &p.Status, &source, &subID); err != nil {
+		&lastUsed, &lastCheck, &p.CreatedAt, &p.Status, &source, &subID,
+		&kiroValidated, &kiroLatency, &avgServeLatency, &consecutiveFails); err != nil {
 		return nil, err
 	}
 	if lastUsed.Valid {
@@ -338,7 +358,161 @@ func scanProxy(rows *sql.Rows) (*Proxy, error) {
 	if subID.Valid {
 		p.SubscriptionID = subID.Int64
 	}
+	if kiroValidated.Valid {
+		p.KiroValidated = kiroValidated.Int64 != 0
+	}
+	if kiroLatency.Valid {
+		p.KiroLatency = int(kiroLatency.Int64)
+	}
+	if avgServeLatency.Valid {
+		p.AvgServeLatency = int(avgServeLatency.Int64)
+	}
+	if consecutiveFails.Valid {
+		p.ConsecutiveFails = int(consecutiveFails.Int64)
+	}
 	return p, nil
+}
+
+func qualityRank(grade string) int {
+	switch grade {
+	case "S":
+		return 0
+	case "A":
+		return 1
+	case "B":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func filterByMaxQualityRank(proxies []Proxy, maxRank int) []Proxy {
+	filtered := make([]Proxy, 0, len(proxies))
+	for _, p := range proxies {
+		if qualityRank(p.QualityGrade) <= maxRank {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered
+}
+
+func selectRotationCandidates(proxies []Proxy) []Proxy {
+	if len(proxies) <= 1 {
+		return proxies
+	}
+
+	candidates := proxies
+	if best := filterByMaxQualityRank(proxies, 1); len(best) >= 6 {
+		candidates = best
+	} else if usable := filterByMaxQualityRank(proxies, 2); len(usable) >= 4 {
+		candidates = usable
+	}
+
+	// Keep the fast half of the pool, capped, so rotation stays diverse but not noisy.
+	latencyWindow := len(candidates) / 2
+	if latencyWindow < 6 {
+		latencyWindow = len(candidates)
+	}
+	if latencyWindow > 40 {
+		latencyWindow = 40
+	}
+	candidates = append([]Proxy(nil), candidates[:latencyWindow]...)
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if qualityRank(candidates[i].QualityGrade) != qualityRank(candidates[j].QualityGrade) {
+			return qualityRank(candidates[i].QualityGrade) < qualityRank(candidates[j].QualityGrade)
+		}
+		if candidates[i].FailCount != candidates[j].FailCount {
+			return candidates[i].FailCount < candidates[j].FailCount
+		}
+		if candidates[i].Latency != candidates[j].Latency {
+			return candidates[i].Latency < candidates[j].Latency
+		}
+		iUnused := candidates[i].LastUsed.IsZero()
+		jUnused := candidates[j].LastUsed.IsZero()
+		if iUnused != jUnused {
+			return iUnused
+		}
+		if !candidates[i].LastUsed.Equal(candidates[j].LastUsed) {
+			return candidates[i].LastUsed.Before(candidates[j].LastUsed)
+		}
+		return candidates[i].UseCount < candidates[j].UseCount
+	})
+
+	candidates = preferDistinctExitIPs(candidates)
+
+	if len(candidates) > 35 {
+		candidates = candidates[:35]
+	}
+
+	return candidates
+}
+
+func preferDistinctExitIPs(proxies []Proxy) []Proxy {
+	if len(proxies) <= 1 {
+		return proxies
+	}
+
+	seen := make(map[string]struct{}, len(proxies))
+	result := make([]Proxy, 0, len(proxies))
+	duplicates := make([]Proxy, 0, len(proxies))
+	unknown := make([]Proxy, 0, len(proxies))
+
+	for _, p := range proxies {
+		if p.ExitIP == "" {
+			unknown = append(unknown, p)
+			continue
+		}
+		if _, ok := seen[p.ExitIP]; ok {
+			duplicates = append(duplicates, p)
+			continue
+		}
+		seen[p.ExitIP] = struct{}{}
+		result = append(result, p)
+	}
+
+	result = append(result, unknown...)
+	result = append(result, duplicates...)
+
+	if len(result) == 0 {
+		return proxies
+	}
+
+	return result
+}
+
+func filterByAvoidExitIPs(proxies []Proxy, avoidExitIPs []string) []Proxy {
+	if len(avoidExitIPs) == 0 {
+		return proxies
+	}
+
+	avoidMap := make(map[string]int, len(avoidExitIPs))
+	for i, ip := range avoidExitIPs {
+		avoidMap[ip] = i
+	}
+
+	var preferred, fallback []Proxy
+	for _, p := range proxies {
+		if p.ExitIP == "" {
+			preferred = append(preferred, p)
+			continue
+		}
+		if _, avoided := avoidMap[p.ExitIP]; !avoided {
+			preferred = append(preferred, p)
+		} else {
+			fallback = append(fallback, p)
+		}
+	}
+
+	if len(preferred) > 0 {
+		return preferred
+	}
+
+	// 全部 IP 都在最近使用列表中，按 LRU 排序（最早使用的优先）
+	sort.SliceStable(fallback, func(i, j int) bool {
+		return avoidMap[fallback[i].ExitIP] < avoidMap[fallback[j].ExitIP]
+	})
+	return fallback
 }
 
 // GetAll 获取所有可用代理
@@ -407,6 +581,38 @@ func (s *Storage) GetRandomExcludeFiltered(excludes []string, sourceFilter strin
 		return s.GetRandom()
 	}
 
+	available = selectRotationCandidates(available)
+	p := available[rand.Intn(len(available))]
+	return &p, nil
+}
+
+func (s *Storage) GetRandomExcludeAvoidExitIPsFiltered(excludes []string, sourceFilter string, avoidExitIPs []string) (*Proxy, error) {
+	proxies, err := s.GetAllFiltered(sourceFilter)
+	if err != nil {
+		return nil, err
+	}
+
+	excludeMap := make(map[string]bool)
+	for _, e := range excludes {
+		excludeMap[e] = true
+	}
+
+	var available []Proxy
+	for _, p := range proxies {
+		if !excludeMap[p.Address] {
+			available = append(available, p)
+		}
+	}
+
+	if len(available) == 0 {
+		if sourceFilter != "" {
+			return nil, fmt.Errorf("no available %s proxy", sourceFilter)
+		}
+		return s.GetRandom()
+	}
+
+	available = filterByAvoidExitIPs(available, avoidExitIPs)
+	available = selectRotationCandidates(available)
 	p := available[rand.Intn(len(available))]
 	return &p, nil
 }
@@ -466,7 +672,36 @@ func (s *Storage) GetRandomByProtocolExcludeFiltered(protocol string, excludes [
 		return nil, fmt.Errorf("no %s proxy available", protocol)
 	}
 
-	proxy := available[time.Now().UnixNano()%int64(len(available))]
+	available = selectRotationCandidates(available)
+	proxy := available[rand.Intn(len(available))]
+	return &proxy, nil
+}
+
+func (s *Storage) GetRandomByProtocolExcludeAvoidExitIPsFiltered(protocol string, excludes []string, sourceFilter string, avoidExitIPs []string) (*Proxy, error) {
+	proxies, err := s.GetAllFiltered(sourceFilter)
+	if err != nil {
+		return nil, err
+	}
+
+	excludeMap := make(map[string]bool)
+	for _, e := range excludes {
+		excludeMap[e] = true
+	}
+
+	var available []Proxy
+	for _, p := range proxies {
+		if p.Protocol == protocol && !excludeMap[p.Address] {
+			available = append(available, p)
+		}
+	}
+
+	if len(available) == 0 {
+		return nil, fmt.Errorf("no %s proxy available", protocol)
+	}
+
+	available = filterByAvoidExitIPs(available, avoidExitIPs)
+	available = selectRotationCandidates(available)
+	proxy := available[rand.Intn(len(available))]
 	return &proxy, nil
 }
 
@@ -495,6 +730,16 @@ func (s *Storage) GetLowestLatencyByProtocolExcludeFiltered(protocol string, exc
 	}
 
 	return nil, fmt.Errorf("no %s proxy available", protocol)
+}
+
+// GetProxySource 查询代理来源（"free" / "custom"），不存在时返回空字符串
+func (s *Storage) GetProxySource(address string) string {
+	var source string
+	err := s.db.QueryRow(`SELECT source FROM proxies WHERE address = ?`, address).Scan(&source)
+	if err != nil {
+		return ""
+	}
+	return source
 }
 
 // Delete 立即删除指定代理
@@ -556,6 +801,116 @@ func (s *Storage) RecordProxyUse(address string, success bool) error {
 		address,
 	)
 	return err
+}
+
+// UpdateKiroValidation 记录代理通过 Kiro/AWS HTTPS 探测的延迟
+func (s *Storage) UpdateKiroValidation(address string, latencyMs int) error {
+	_, err := s.db.Exec(
+		`UPDATE proxies SET kiro_validated = 1, kiro_latency = ? WHERE address = ?`,
+		latencyMs, address,
+	)
+	return err
+}
+
+// UpdateServeLatency 更新实际使用的建连延迟（指数移动平均，alpha=0.3）
+func (s *Storage) UpdateServeLatency(address string, latencyMs int) error {
+	var current sql.NullInt64
+	s.db.QueryRow(`SELECT avg_serve_latency FROM proxies WHERE address = ?`, address).Scan(&current)
+	newAvg := latencyMs
+	if current.Valid && current.Int64 > 0 {
+		// EMA: new = alpha * sample + (1-alpha) * old
+		newAvg = int(0.3*float64(latencyMs) + 0.7*float64(current.Int64))
+	}
+	_, err := s.db.Exec(
+		`UPDATE proxies SET avg_serve_latency = ? WHERE address = ?`,
+		newAvg, address,
+	)
+	return err
+}
+
+// IncrementConsecutiveFails 增加连续失败次数，返回累计次数
+func (s *Storage) IncrementConsecutiveFails(address string) (int, error) {
+	_, err := s.db.Exec(
+		`UPDATE proxies SET consecutive_fails = consecutive_fails + 1 WHERE address = ?`,
+		address,
+	)
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	err = s.db.QueryRow(`SELECT consecutive_fails FROM proxies WHERE address = ?`, address).Scan(&count)
+	return count, err
+}
+
+// ResetConsecutiveFails 重置连续失败次数（成功时调用）
+func (s *Storage) ResetConsecutiveFails(address string) error {
+	_, err := s.db.Exec(
+		`UPDATE proxies SET consecutive_fails = 0 WHERE address = ?`,
+		address,
+	)
+	return err
+}
+
+// GetCriticalHostProxies 获取可用于关键主机的代理（S/A 级 + kiro_validated）
+func (s *Storage) GetCriticalHostProxies(sourceFilter string) ([]Proxy, error) {
+	query := `SELECT ` + proxyColumns + `
+		 FROM proxies
+		 WHERE status IN ('active', 'degraded') AND fail_count < 3
+		   AND kiro_validated = 1 AND quality_grade IN ('S', 'A')
+		   AND consecutive_fails < 3`
+	var args []interface{}
+	if sourceFilter != "" {
+		query += ` AND source = ?`
+		args = append(args, sourceFilter)
+	}
+	query += ` ORDER BY avg_serve_latency ASC, latency ASC`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var proxies []Proxy
+	for rows.Next() {
+		p, err := scanProxy(rows)
+		if err != nil {
+			return nil, err
+		}
+		proxies = append(proxies, *p)
+	}
+	return proxies, nil
+}
+
+// GetCriticalHostProxiesByProtocol 按协议获取可用于关键主机的代理
+func (s *Storage) GetCriticalHostProxiesByProtocol(protocol, sourceFilter string) ([]Proxy, error) {
+	query := `SELECT ` + proxyColumns + `
+		 FROM proxies
+		 WHERE status IN ('active', 'degraded') AND fail_count < 3
+		   AND kiro_validated = 1 AND quality_grade IN ('S', 'A')
+		   AND consecutive_fails < 3 AND protocol = ?`
+	args := []interface{}{protocol}
+	if sourceFilter != "" {
+		query += ` AND source = ?`
+		args = append(args, sourceFilter)
+	}
+	query += ` ORDER BY avg_serve_latency ASC, latency ASC`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var proxies []Proxy
+	for rows.Next() {
+		p, err := scanProxy(rows)
+		if err != nil {
+			return nil, err
+		}
+		proxies = append(proxies, *p)
+	}
+	return proxies, nil
 }
 
 // GetWorstProxies 获取指定协议中延迟最高的N个代理（仅免费代理）
@@ -672,7 +1027,7 @@ func (s *Storage) GetQualityDistribution() (map[string]int, error) {
 	return dist, nil
 }
 
-// GetBatchForHealthCheck 获取一批需要健康检查的代理
+// GetBatchForHealthCheck 获取一批需要健康检查的代理。batchSize <= 0 表示不限制，返回全部。
 func (s *Storage) GetBatchForHealthCheck(batchSize int, skipSGrade bool) ([]Proxy, error) {
 	query := `SELECT ` + proxyColumns + `
 		 FROM proxies
@@ -682,12 +1037,18 @@ func (s *Storage) GetBatchForHealthCheck(batchSize int, skipSGrade bool) ([]Prox
 		query += ` AND quality_grade != 'S'`
 	}
 
-	query += ` ORDER BY 
+	query += ` ORDER BY
 		COALESCE(last_check, '1970-01-01') ASC,
-		quality_grade DESC
-		LIMIT ?`
+		quality_grade DESC`
 
-	rows, err := s.db.Query(query, batchSize)
+	var rows *sql.Rows
+	var err error
+	if batchSize > 0 {
+		query += ` LIMIT ?`
+		rows, err = s.db.Query(query, batchSize)
+	} else {
+		rows, err = s.db.Query(query)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -933,7 +1294,7 @@ func (s *Storage) EnableProxy(address string) error {
 // GetDisabledCustomProxies 获取所有被禁用的订阅代理
 func (s *Storage) GetDisabledCustomProxies() ([]Proxy, error) {
 	rows, err := s.db.Query(
-		`SELECT `+proxyColumns+`
+		`SELECT ` + proxyColumns + `
 		 FROM proxies
 		 WHERE source = 'custom' AND status = 'disabled'`,
 	)
@@ -1096,7 +1457,7 @@ func (s *Storage) GetSubscriptions() ([]Subscription, error) {
 // GetSubscription 获取单个订阅
 func (s *Storage) GetSubscription(id int64) (*Subscription, error) {
 	rows, err := s.db.Query(
-		`SELECT ` + subColumns + `
+		`SELECT `+subColumns+`
 		 FROM subscriptions WHERE id = ?`, id,
 	)
 	if err != nil {

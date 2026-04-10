@@ -115,6 +115,9 @@ func main() {
 	// 启动状态监控协程
 	go startStatusMonitor(poolMgr, fetch, validate, store)
 
+	// 启动 5 分钟主动拉取定时器（快速源）
+	go startProactiveFetch(fetch, validate, poolMgr)
+
 	// 启动健康检查器
 	healthChecker.StartBackground()
 
@@ -241,7 +244,8 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 			Latency:      latencyMs,
 		}
 
-		if added, reason := poolMgr.TryAddProxy(proxyToAdd); added {
+		httpsMs := int(result.HTTPSLatency.Milliseconds())
+		if added, reason := poolMgr.TryAddProxy(proxyToAdd, httpsMs); added {
 			addedCount.Add(1)
 		} else if reason == "slots_full" {
 			rejectedFull.Add(1)
@@ -308,6 +312,82 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 		len(candidates), validCount.Load(), addedCount.Load(),
 		rejectedNoExit.Load(), rejectedLatency.Load(), rejectedGeo.Load(), rejectedFull.Load(),
 		finalStatus.State, finalStatus.HTTP, finalStatus.SOCKS5)
+}
+
+// startProactiveFetch 每 5 分钟主动从快速源拉取新代理，替换池中差代理
+func startProactiveFetch(fetch *fetcher.Fetcher, validate *validator.Validator, poolMgr *pool.Manager) {
+	ticker := time.NewTicker(5 * time.Minute)
+	log.Println("[proactive] 主动拉取器已启动（每5分钟从快速源拉取）")
+
+	for range ticker.C {
+		proactiveFetchAndOptimize(fetch, validate, poolMgr)
+	}
+}
+
+// proactiveFetchAndOptimize 主动拉取快速源并尝试替换差代理
+func proactiveFetchAndOptimize(fetch *fetcher.Fetcher, validate *validator.Validator, poolMgr *pool.Manager) {
+	if !fetchRunning.CompareAndSwap(false, true) {
+		log.Println("[proactive] 有抓取任务在运行，跳过本轮主动拉取")
+		return
+	}
+	defer fetchRunning.Store(false)
+
+	candidates, err := fetch.FetchFast()
+	if err != nil {
+		log.Printf("[proactive] 快速源拉取失败: %v", err)
+		return
+	}
+
+	if len(candidates) == 0 {
+		log.Println("[proactive] 无新代理（均已去重），跳过")
+		return
+	}
+
+	log.Printf("[proactive] 拉取到 %d 个新候选代理，开始验证...", len(candidates))
+
+	cfg := config.Get()
+	status, _ := poolMgr.GetStatus()
+
+	var addedCount, validCount, replacedCount int32
+
+	for result := range validate.ValidateStream(candidates) {
+		if !result.Valid {
+			continue
+		}
+
+		validCount++
+
+		latencyMs := int(result.Latency.Milliseconds())
+		maxLatency := cfg.GetLatencyThreshold(status.State)
+
+		if result.ExitIP == "" || result.ExitLocation == "" {
+			continue
+		}
+		if latencyMs > maxLatency {
+			continue
+		}
+
+		proxyToAdd := storage.Proxy{
+			Address:      result.Proxy.Address,
+			Protocol:     result.Proxy.Protocol,
+			ExitIP:       result.ExitIP,
+			ExitLocation: result.ExitLocation,
+			Latency:      latencyMs,
+		}
+
+		httpsMs := int(result.HTTPSLatency.Milliseconds())
+		if added, reason := poolMgr.TryAddProxy(proxyToAdd, httpsMs); added {
+			addedCount++
+			if reason == "replaced" {
+				replacedCount++
+			}
+		}
+	}
+
+	if validCount > 0 || addedCount > 0 {
+		log.Printf("[proactive] 主动拉取完成: 验证通过 %d 入池 %d 替换 %d",
+			validCount, addedCount, replacedCount)
+	}
 }
 
 // startStatusMonitor 状态监控协程

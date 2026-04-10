@@ -65,14 +65,22 @@ type Config struct {
 	MaxLatencyDegradation int // 降级模式超宽松延迟（默认5000ms）
 
 	// ========== 验证配置 ==========
-	ValidateConcurrency int    // 验证并发数（默认300）
-	ValidateTimeout     int    // 验证超时（秒）（默认8）
-	ValidateURL         string // 验证目标 URL
+	ValidateConcurrency int      // 验证并发数（默认300）
+	ValidateTimeout     int      // 验证超时（秒）（默认8）
+	ValidateURL         string   // 验证目标 URL
+	HTTPSTestTargets    []string // 额外 HTTPS/TLS 探测目标（用于筛掉无法稳定访问真实上游的代理）
 
 	// ========== 健康检查配置 ==========
-	HealthCheckInterval   int // 状态监控间隔（分钟）（默认5）
-	HealthCheckBatchSize  int // 每批验证数量（默认20）
+	HealthCheckInterval    int // 状态监控间隔（分钟）（默认5）
+	HealthCheckBatchSize   int // 每批验证数量（默认20）
 	HealthCheckConcurrency int // 批次内并发数（默认50）
+
+	// ========== 代理服务配置 ==========
+	ProxyServeTimeout        int      // 代理服务连接超时（秒，默认5，比验证超时更短）
+	TunnelIdleTimeout        int      // 隧道空闲超时（秒，默认58，超过无数据流动则判定代理异常）
+	KiroLatencyThreshold     int      // Kiro/AWS HTTPS 探测延迟阈值（ms，默认3000，超过则拒绝入池）
+	CriticalHosts            []string // 关键目标主机后缀（匹配时只用 S/A + kiro_validated 代理）
+	ConsecutiveFailThreshold int      // 连续失败踢出阈值（默认2）
 
 	// ========== 优化配置 ==========
 	OptimizeInterval    int     // 优化轮换间隔（分钟）（默认30）
@@ -123,7 +131,7 @@ func DefaultConfig() *Config {
 	if password == "" {
 		password = DefaultPassword
 	}
-	
+
 	// 读取代理认证配置
 	proxyAuthEnabled := os.Getenv("PROXY_AUTH_ENABLED") == "true"
 	proxyAuthUsername := os.Getenv("PROXY_AUTH_USERNAME")
@@ -135,7 +143,7 @@ func DefaultConfig() *Config {
 	if proxyAuthPassword != "" {
 		proxyAuthHash = passwordHash(proxyAuthPassword)
 	}
-	
+
 	// 读取地理过滤配置
 	blockedCountries := []string{"CN"} // 默认屏蔽中国大陆
 	if blockedEnv := os.Getenv("BLOCKED_COUNTRIES"); blockedEnv != "" {
@@ -162,7 +170,7 @@ func DefaultConfig() *Config {
 			}
 		}
 	}
-	
+
 	// 读取订阅代理配置
 	customProxyMode := os.Getenv("CUSTOM_PROXY_MODE")
 	if customProxyMode == "" {
@@ -171,6 +179,26 @@ func DefaultConfig() *Config {
 	singBoxPath := os.Getenv("SINGBOX_PATH")
 	if singBoxPath == "" {
 		singBoxPath = "sing-box"
+	}
+
+	validateURL := os.Getenv("VALIDATE_URL")
+	if validateURL == "" {
+		validateURL = "http://www.gstatic.com/generate_204"
+	}
+
+	httpsTestTargets := []string{
+		"https://q.us-east-1.amazonaws.com/",
+		"https://oidc.us-east-1.amazonaws.com/token",
+	}
+	if targetsEnv := os.Getenv("HTTPS_TEST_TARGETS"); targetsEnv != "" {
+		targets := strings.Split(targetsEnv, ",")
+		httpsTestTargets = make([]string, 0, len(targets))
+		for _, target := range targets {
+			target = strings.TrimSpace(target)
+			if target != "" {
+				httpsTestTargets = append(httpsTestTargets, target)
+			}
+		}
 	}
 
 	return &Config{
@@ -182,21 +210,21 @@ func DefaultConfig() *Config {
 		SOCKS5Port:        ":7779",
 		StableSOCKS5Port:  ":7780",
 		DBPath:            dataDir() + "proxy.db",
-		
+
 		// 代理认证配置
 		ProxyAuthEnabled:      proxyAuthEnabled,
 		ProxyAuthUsername:     proxyAuthUsername,
 		ProxyAuthPassword:     proxyAuthPassword,
 		ProxyAuthPasswordHash: proxyAuthHash,
-		
+
 		// 地理过滤配置
 		BlockedCountries: blockedCountries,
 		AllowedCountries: allowedCountries,
 
 		// 池子容量配置
-		PoolMaxSize:        100,  // 总容量
-		PoolHTTPRatio:      0.3,  // HTTP占30%
-		PoolMinPerProtocol: 10,   // 每协议最少10个
+		PoolMaxSize:        100, // 总容量
+		PoolHTTPRatio:      0.3, // HTTP占30%
+		PoolMinPerProtocol: 10,  // 每协议最少10个
 
 		// 延迟标准配置
 		MaxLatencyMs:          2500, // 标准2.5秒
@@ -207,12 +235,20 @@ func DefaultConfig() *Config {
 		// 验证配置
 		ValidateConcurrency: 300,
 		ValidateTimeout:     10, // 从8秒增加到10秒
-		ValidateURL:         "http://www.gstatic.com/generate_204",
+		ValidateURL:         validateURL,
+		HTTPSTestTargets:    httpsTestTargets,
 
 		// 健康检查配置
 		HealthCheckInterval:    5,  // 5分钟
 		HealthCheckBatchSize:   20, // 每批20个
 		HealthCheckConcurrency: 50, // 批次并发50
+
+		// 代理服务配置
+		ProxyServeTimeout:        5,    // 代理服务连接超时5秒
+		TunnelIdleTimeout:        58,   // 隧道空闲超时58秒
+		KiroLatencyThreshold:     3000, // Kiro HTTPS探测延迟阈值3000ms
+		CriticalHosts:            []string{"amazonaws.com"},
+		ConsecutiveFailThreshold: 2, // 连续失败2次踢出
 
 		// 优化配置
 		OptimizeInterval:    30,  // 30分钟
@@ -236,12 +272,12 @@ func DefaultConfig() *Config {
 		SingBoxBasePort:       20000,
 
 		// 兼容旧配置
-		MaxResponseMs: 5000,
-		MaxFailCount:  3,
-		MaxRetry:      3,
-		FetchInterval: 30,
-		CheckInterval: 10,
-		HTTPSourceURL: "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
+		MaxResponseMs:   5000,
+		MaxFailCount:    3,
+		MaxRetry:        3,
+		FetchInterval:   30,
+		CheckInterval:   10,
+		HTTPSourceURL:   "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
 		SOCKS5SourceURL: "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt",
 	}
 }
@@ -260,8 +296,8 @@ func Load() *Config {
 			if saved.PoolHTTPRatio > 0 && saved.PoolHTTPRatio <= 1 {
 				cfg.PoolHTTPRatio = saved.PoolHTTPRatio
 			}
-			if saved.PoolMinPerProtocol > 0 {
-				cfg.PoolMinPerProtocol = saved.PoolMinPerProtocol
+			if saved.PoolMinPerProtocol != nil && *saved.PoolMinPerProtocol >= 0 {
+				cfg.PoolMinPerProtocol = *saved.PoolMinPerProtocol
 			}
 
 			// 延迟配置
@@ -297,6 +333,23 @@ func Load() *Config {
 			}
 			if saved.ReplaceThreshold > 0 && saved.ReplaceThreshold <= 1 {
 				cfg.ReplaceThreshold = saved.ReplaceThreshold
+			}
+
+			// 代理服务配置
+			if saved.ProxyServeTimeout > 0 {
+				cfg.ProxyServeTimeout = saved.ProxyServeTimeout
+			}
+			if saved.TunnelIdleTimeout > 0 {
+				cfg.TunnelIdleTimeout = saved.TunnelIdleTimeout
+			}
+			if saved.KiroLatencyThreshold > 0 {
+				cfg.KiroLatencyThreshold = saved.KiroLatencyThreshold
+			}
+			if saved.CriticalHosts != nil {
+				cfg.CriticalHosts = saved.CriticalHosts
+			}
+			if saved.ConsecutiveFailThreshold > 0 {
+				cfg.ConsecutiveFailThreshold = saved.ConsecutiveFailThreshold
 			}
 
 			// 兼容旧配置
@@ -357,7 +410,7 @@ type savedConfig struct {
 	// 池子配置
 	PoolMaxSize        int     `json:"pool_max_size"`
 	PoolHTTPRatio      float64 `json:"pool_http_ratio"`
-	PoolMinPerProtocol int     `json:"pool_min_per_protocol"`
+	PoolMinPerProtocol *int    `json:"pool_min_per_protocol"`
 
 	// 延迟配置
 	MaxLatencyMs        int `json:"max_latency_ms"`
@@ -375,6 +428,13 @@ type savedConfig struct {
 	// 优化配置
 	OptimizeInterval int     `json:"optimize_interval"`
 	ReplaceThreshold float64 `json:"replace_threshold"`
+
+	// 代理服务配置
+	ProxyServeTimeout        int      `json:"proxy_serve_timeout,omitempty"`
+	TunnelIdleTimeout        int      `json:"tunnel_idle_timeout,omitempty"`
+	KiroLatencyThreshold     int      `json:"kiro_latency_threshold,omitempty"`
+	CriticalHosts            []string `json:"critical_hosts,omitempty"`
+	ConsecutiveFailThreshold int      `json:"consecutive_fail_threshold,omitempty"`
 
 	// 地理过滤配置
 	BlockedCountries []string `json:"blocked_countries,omitempty"`
@@ -402,30 +462,36 @@ func Save(cfg *Config) error {
 
 	customPriority := cfg.CustomPriority
 	customFreePriority := cfg.CustomFreePriority
+	poolMinPerProtocol := cfg.PoolMinPerProtocol
 	data, err := json.MarshalIndent(savedConfig{
-		PoolMaxSize:           cfg.PoolMaxSize,
-		PoolHTTPRatio:         cfg.PoolHTTPRatio,
-		PoolMinPerProtocol:    cfg.PoolMinPerProtocol,
-		MaxLatencyMs:          cfg.MaxLatencyMs,
-		MaxLatencyEmergency:   cfg.MaxLatencyEmergency,
-		MaxLatencyHealthy:     cfg.MaxLatencyHealthy,
-		ValidateConcurrency:   cfg.ValidateConcurrency,
-		ValidateTimeout:       cfg.ValidateTimeout,
-		HealthCheckInterval:   cfg.HealthCheckInterval,
-		HealthCheckBatchSize:  cfg.HealthCheckBatchSize,
-		OptimizeInterval:      cfg.OptimizeInterval,
-		ReplaceThreshold:      cfg.ReplaceThreshold,
-		BlockedCountries:      cfg.BlockedCountries,
-		AllowedCountries:      cfg.AllowedCountries,
-		CustomProxyMode:       cfg.CustomProxyMode,
-		CustomPriority:        &customPriority,
-		CustomFreePriority:    &customFreePriority,
-		CustomProbeInterval:   cfg.CustomProbeInterval,
-		CustomRefreshInterval: cfg.CustomRefreshInterval,
-		SingBoxPath:           cfg.SingBoxPath,
-		SingBoxBasePort:       cfg.SingBoxBasePort,
-		FetchInterval:         cfg.FetchInterval,
-		CheckInterval:         cfg.CheckInterval,
+		PoolMaxSize:              cfg.PoolMaxSize,
+		PoolHTTPRatio:            cfg.PoolHTTPRatio,
+		PoolMinPerProtocol:       &poolMinPerProtocol,
+		MaxLatencyMs:             cfg.MaxLatencyMs,
+		MaxLatencyEmergency:      cfg.MaxLatencyEmergency,
+		MaxLatencyHealthy:        cfg.MaxLatencyHealthy,
+		ValidateConcurrency:      cfg.ValidateConcurrency,
+		ValidateTimeout:          cfg.ValidateTimeout,
+		HealthCheckInterval:      cfg.HealthCheckInterval,
+		HealthCheckBatchSize:     cfg.HealthCheckBatchSize,
+		OptimizeInterval:         cfg.OptimizeInterval,
+		ReplaceThreshold:         cfg.ReplaceThreshold,
+		ProxyServeTimeout:        cfg.ProxyServeTimeout,
+		TunnelIdleTimeout:        cfg.TunnelIdleTimeout,
+		KiroLatencyThreshold:     cfg.KiroLatencyThreshold,
+		CriticalHosts:            cfg.CriticalHosts,
+		ConsecutiveFailThreshold: cfg.ConsecutiveFailThreshold,
+		BlockedCountries:         cfg.BlockedCountries,
+		AllowedCountries:         cfg.AllowedCountries,
+		CustomProxyMode:          cfg.CustomProxyMode,
+		CustomPriority:           &customPriority,
+		CustomFreePriority:       &customFreePriority,
+		CustomProbeInterval:      cfg.CustomProbeInterval,
+		CustomRefreshInterval:    cfg.CustomRefreshInterval,
+		SingBoxPath:              cfg.SingBoxPath,
+		SingBoxBasePort:          cfg.SingBoxBasePort,
+		FetchInterval:            cfg.FetchInterval,
+		CheckInterval:            cfg.CheckInterval,
 	}, "", "  ")
 	if err != nil {
 		return err
@@ -447,6 +513,24 @@ func (c *Config) CalculateSlots() (httpSlots, socks5Slots int) {
 	}
 
 	return
+}
+
+// IsCriticalHost 判断目标主机是否匹配关键主机后缀列表
+func (c *Config) IsCriticalHost(host string) bool {
+	if len(c.CriticalHosts) == 0 {
+		return false
+	}
+	host = strings.ToLower(host)
+	// 去掉端口
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+	for _, suffix := range c.CriticalHosts {
+		if strings.HasSuffix(host, strings.ToLower(suffix)) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetLatencyThreshold 根据池子状态返回合适的延迟阈值

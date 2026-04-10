@@ -66,9 +66,14 @@ func (m *Manager) GetStatus() (*PoolStatus, error) {
 // determineState 判断池子状态
 func (m *Manager) determineState(total, httpCount, socks5Count int) string {
 	httpSlots, socks5Slots := m.cfg.CalculateSlots()
+	needHTTP := httpSlots > 0
+	needSOCKS5 := socks5Slots > 0
 
 	// 单协议缺失
-	if httpCount == 0 || socks5Count == 0 {
+	if needHTTP && httpCount == 0 {
+		return "emergency"
+	}
+	if needSOCKS5 && socks5Count == 0 {
 		return "emergency"
 	}
 
@@ -79,12 +84,14 @@ func (m *Manager) determineState(total, httpCount, socks5Count int) string {
 	}
 
 	// 危急：任一协议<20%槽位
-	if httpCount < int(float64(httpSlots)*0.2) || socks5Count < int(float64(socks5Slots)*0.2) {
+	httpCritical := needHTTP && httpCount < int(float64(httpSlots)*0.2)
+	socks5Critical := needSOCKS5 && socks5Count < int(float64(socks5Slots)*0.2)
+	if httpCritical || socks5Critical {
 		return "critical"
 	}
 
-	// 警告：总数<95%
-	healthyThreshold := int(float64(m.cfg.PoolMaxSize) * 0.95)
+	// 警告：总数<75%
+	healthyThreshold := int(float64(m.cfg.PoolMaxSize) * 0.75)
 	if total < healthyThreshold {
 		return "warning"
 	}
@@ -95,11 +102,14 @@ func (m *Manager) determineState(total, httpCount, socks5Count int) string {
 
 // NeedsFetch 判断是否需要抓取以及抓取模式
 func (m *Manager) NeedsFetch(status *PoolStatus) (bool, string, string) {
+	requireHTTP := status.HTTPSlots > 0
+	requireSOCKS5 := status.SOCKS5Slots > 0
+
 	// 单协议缺失：紧急模式，指定协议
-	if status.HTTP == 0 {
+	if requireHTTP && status.HTTP == 0 {
 		return true, "emergency", "http"
 	}
-	if status.SOCKS5 == 0 {
+	if requireSOCKS5 && status.SOCKS5 == 0 {
 		return true, "emergency", "socks5"
 	}
 
@@ -111,18 +121,24 @@ func (m *Manager) NeedsFetch(status *PoolStatus) (bool, string, string) {
 	// 危急或警告：补充模式
 	if status.State == "critical" || status.State == "warning" {
 		// 判断哪个协议更缺
-		httpPct := float64(status.HTTP) / float64(status.HTTPSlots)
-		socks5Pct := float64(status.SOCKS5) / float64(status.SOCKS5Slots)
+		httpPct := 1.0
+		socks5Pct := 1.0
+		if requireHTTP {
+			httpPct = float64(status.HTTP) / float64(status.HTTPSlots)
+		}
+		if requireSOCKS5 {
+			socks5Pct = float64(status.SOCKS5) / float64(status.SOCKS5Slots)
+		}
 
 		// 如果两个协议都缺（都<50%），同时补充两个协议
-		if httpPct < 0.5 && socks5Pct < 0.5 {
+		if requireHTTP && requireSOCKS5 && httpPct < 0.5 && socks5Pct < 0.5 {
 			return true, "refill", ""
 		}
 		// 只有一个协议缺时，优先补充更缺的
-		if httpPct < 0.5 {
+		if requireHTTP && httpPct < 0.5 {
 			return true, "refill", "http"
 		}
-		if socks5Pct < 0.5 {
+		if requireSOCKS5 && socks5Pct < 0.5 {
 			return true, "refill", "socks5"
 		}
 		return true, "refill", ""
@@ -138,14 +154,22 @@ func (m *Manager) NeedsFetchQuick(status *PoolStatus) bool {
 	return need
 }
 
-// TryAddProxy 尝试将代理加入池子
-func (m *Manager) TryAddProxy(p storage.Proxy) (bool, string) {
+// TryAddProxy 尝试将代理加入池子，httpsLatencyMs 为 Kiro HTTPS 探测延迟
+func (m *Manager) TryAddProxy(p storage.Proxy, httpsLatencyMs ...int) (bool, string) {
+	kiroMs := 0
+	if len(httpsLatencyMs) > 0 {
+		kiroMs = httpsLatencyMs[0]
+	}
+
 	// 订阅代理直接入池，不受 slot 限制
 	if p.Source == "custom" {
 		if err := m.storage.AddProxyWithSource(p.Address, p.Protocol, "custom"); err != nil {
 			return false, "db_error"
 		}
 		m.storage.UpdateExitInfo(p.Address, p.ExitIP, p.ExitLocation, p.Latency)
+		if kiroMs > 0 {
+			m.storage.UpdateKiroValidation(p.Address, kiroMs)
+		}
 		log.Printf("[pool] ✅ 订阅代理入池: %s (%s) %dms %s", p.Address, p.Protocol, p.Latency, p.ExitLocation)
 		return true, "added_custom"
 	}
@@ -165,13 +189,20 @@ func (m *Manager) TryAddProxy(p storage.Proxy) (bool, string) {
 		currentCount = socks5Count
 	}
 
+	// 入池后记录 Kiro 验证信息的辅助函数
+	markKiro := func(address string) {
+		if kiroMs > 0 {
+			m.storage.UpdateKiroValidation(address, kiroMs)
+		}
+	}
+
 	// 情况1：该协议槽位未满，直接加入
 	if currentCount < maxSlots {
 		if err := m.storage.AddProxy(p.Address, p.Protocol); err != nil {
 			return false, "db_error"
 		}
-		// 更新完整信息
 		m.storage.UpdateExitInfo(p.Address, p.ExitIP, p.ExitLocation, p.Latency)
+		markKiro(p.Address)
 		log.Printf("[pool] ✅ 直接入池: %s (%s %d/%d) %dms %s %s",
 			p.Address, p.Protocol, currentCount+1, maxSlots, p.Latency, p.ExitIP, p.ExitLocation)
 		return true, "added"
@@ -184,6 +215,7 @@ func (m *Manager) TryAddProxy(p storage.Proxy) (bool, string) {
 			return false, "db_error"
 		}
 		m.storage.UpdateExitInfo(p.Address, p.ExitIP, p.ExitLocation, p.Latency)
+		markKiro(p.Address)
 		log.Printf("[pool] ✅ 浮动入池: %s (%s %d/%d+%d) %dms",
 			p.Address, p.Protocol, currentCount+1, maxSlots, allowedFloat, p.Latency)
 		return true, "added_float"
@@ -191,7 +223,11 @@ func (m *Manager) TryAddProxy(p storage.Proxy) (bool, string) {
 
 	// 情况3：池子满了，尝试替换
 	if currentCount >= maxSlots || total >= m.cfg.PoolMaxSize {
-		return m.tryReplace(p)
+		added, reason := m.tryReplace(p)
+		if added {
+			markKiro(p.Address)
+		}
+		return added, reason
 	}
 
 	return false, "slots_full"

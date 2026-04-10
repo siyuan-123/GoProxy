@@ -180,7 +180,7 @@ func (m *Manager) probeDisabled() {
 	recovered := 0
 	recoveredSubs := make(map[int64]bool)
 	for _, proxy := range disabled {
-		valid, latency, exitIP, exitLocation := m.validator.ValidateOne(proxy)
+		valid, latency, exitIP, exitLocation, httpsLatency := m.validator.ValidateOne(proxy)
 		if valid {
 			// 检查地理过滤：恢复前确认不在屏蔽列表中
 			if exitLocation != "" && isGeoBlocked(exitLocation, cfg) {
@@ -190,6 +190,9 @@ func (m *Manager) probeDisabled() {
 			}
 			m.storage.EnableProxy(proxy.Address)
 			m.storage.UpdateExitInfo(proxy.Address, exitIP, exitLocation, int(latency.Milliseconds()))
+			if httpsLatency > 0 {
+				m.storage.UpdateKiroValidation(proxy.Address, int(httpsLatency.Milliseconds()))
+			}
 			recovered++
 			recoveredSubs[proxy.SubscriptionID] = true
 			log.Printf("[custom] ✅ 代理 %s 恢复可用 (%dms)", proxy.Address, latency.Milliseconds())
@@ -366,7 +369,7 @@ func (m *Manager) fetchSubscriptionData(sub *storage.Subscription) ([]byte, erro
 	if sub.FilePath != "" {
 		data, err := os.ReadFile(sub.FilePath)
 		if err != nil {
-			return nil, fmt.Errorf("读取文件 %s 失败: %w", sub.FilePath, err)
+			return nil, fmt.Errorf("读取订阅文件失败: %w", err)
 		}
 		return data, nil
 	}
@@ -391,7 +394,7 @@ func (m *Manager) fetchWithRetry(urlStr string) ([]byte, error) {
 	if err == nil {
 		return data, nil
 	}
-	log.Printf("[custom] 直连订阅 URL 失败: %v，尝试通过代理访问...", err)
+	log.Printf("[custom] 直连订阅失败，尝试通过代理访问...")
 
 	// 直连失败，尝试通过池中已有代理访问
 	for i := 0; i < 3; i++ {
@@ -401,13 +404,13 @@ func (m *Manager) fetchWithRetry(urlStr string) ([]byte, error) {
 		}
 		data, err = m.fetchURL(urlStr, p)
 		if err == nil {
-			log.Printf("[custom] ✅ 通过代理 %s 成功访问订阅 URL", p.Address)
+			log.Printf("[custom] ✅ 通过代理 %s 成功访问订阅", p.Address)
 			return data, nil
 		}
-		log.Printf("[custom] 代理 %s 访问订阅 URL 失败: %v", p.Address, err)
+		log.Printf("[custom] 代理 %s 访问订阅失败", p.Address)
 	}
 
-	return nil, fmt.Errorf("直连和代理均无法访问订阅 URL: %w", err)
+	return nil, fmt.Errorf("直连和代理均无法访问订阅")
 }
 
 // fetchURL 通过指定代理（或直连）拉取 URL 内容
@@ -470,6 +473,10 @@ func (m *Manager) validateCustomProxies(proxies []storage.Proxy, subID int64) in
 		if result.Valid {
 			latencyMs := int(result.Latency.Milliseconds())
 			m.storage.UpdateExitInfo(result.Proxy.Address, result.ExitIP, result.ExitLocation, latencyMs)
+			// 记录 Kiro HTTPS 验证结果
+			if result.HTTPSLatency > 0 {
+				m.storage.UpdateKiroValidation(result.Proxy.Address, int(result.HTTPSLatency.Milliseconds()))
+			}
 			// 检查地理过滤
 			if result.ExitLocation != "" && isGeoBlocked(result.ExitLocation, cfg) {
 				m.storage.DisableProxy(result.Proxy.Address)

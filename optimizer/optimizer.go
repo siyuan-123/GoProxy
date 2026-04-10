@@ -58,19 +58,27 @@ func (o *Optimizer) RunOnce() {
 
 	log.Printf("[optimize] 抓取到 %d 个候选代理", len(candidates))
 
+	type validCandidate struct {
+		proxy       storage.Proxy
+		httpsMs     int
+	}
+
 	// 验证候选代理
-	validCandidates := []storage.Proxy{}
+	var validCandidates []validCandidate
 	for result := range o.validator.ValidateStream(candidates) {
 		if result.Valid {
 			latencyMs := int(result.Latency.Milliseconds())
-			// 只保留延迟在健康标准内的
 			if latencyMs <= o.cfg.MaxLatencyHealthy {
-				validCandidates = append(validCandidates, storage.Proxy{
-					Address:      result.Proxy.Address,
-					Protocol:     result.Proxy.Protocol,
-					ExitIP:       result.ExitIP,
-					ExitLocation: result.ExitLocation,
-					Latency:      latencyMs,
+				httpsMs := int(result.HTTPSLatency.Milliseconds())
+				validCandidates = append(validCandidates, validCandidate{
+					proxy: storage.Proxy{
+						Address:      result.Proxy.Address,
+						Protocol:     result.Proxy.Protocol,
+						ExitIP:       result.ExitIP,
+						ExitLocation: result.ExitLocation,
+						Latency:      latencyMs,
+					},
+					httpsMs: httpsMs,
 				})
 			}
 		}
@@ -85,8 +93,8 @@ func (o *Optimizer) RunOnce() {
 
 	// 尝试用优质候选替换延迟高的代理
 	replacedCount := 0
-	for _, candidate := range validCandidates {
-		added, reason := o.poolMgr.TryAddProxy(candidate)
+	for _, vc := range validCandidates {
+		added, reason := o.poolMgr.TryAddProxy(vc.proxy, vc.httpsMs)
 		if added && reason == "replaced" {
 			replacedCount++
 		}

@@ -7,10 +7,13 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"goproxy/storage"
 )
+
+const dedupTTL = 24 * time.Hour
 
 // 代理来源定义
 type Source struct {
@@ -34,6 +37,26 @@ var fastUpdateSources = []Source{
 	{"https://cdn.jsdelivr.net/gh/sunny9577/proxy-scraper/generated/http_proxies.txt", "http"},
 	{"https://cdn.jsdelivr.net/gh/sunny9577/proxy-scraper/generated/socks5_proxies.txt", "socks5"},
 	{"https://cdn.jsdelivr.net/gh/sunny9577/proxy-scraper/generated/socks4_proxies.txt", "socks5"},
+	// proxifly - 每5分钟更新
+	{"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt", "http"},
+	{"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt", "socks5"},
+	{"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt", "socks5"},
+	// TheSpeedX/PROXY-List - 每10分钟更新，量大
+	{"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "http"},
+	{"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt", "socks5"},
+	{"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt", "socks5"},
+	// mmpx12 - 每小时更新
+	{"https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt", "http"},
+	{"https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt", "socks5"},
+	{"https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks4.txt", "socks5"},
+	// jetkai - 每小时更新，预验证
+	{"https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt", "http"},
+	{"https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt", "socks5"},
+	{"https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks4.txt", "socks5"},
+	// ShiftyTR - 每小时更新
+	{"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt", "http"},
+	{"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt", "socks5"},
+	{"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt", "socks5"},
 }
 
 // 慢速更新源（每天更新）- 用于优化轮换模式
@@ -67,21 +90,35 @@ var slowUpdateSources = []Source{
 	// proxy4parsing
 	{"https://cdn.jsdelivr.net/gh/proxy4parsing/proxy-list/http.txt", "http"},
 	{"https://cdn.jsdelivr.net/gh/proxy4parsing/proxy-list/socks5.txt", "socks5"},
+	// MuRongPIG/Proxy-Master - 超大量，每日更新
+	{"https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt", "http"},
+	{"https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt", "socks5"},
+	// clarketm/proxy-list - HTTP 专项
+	{"https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt", "http"},
+	// Thordata - 每日更新，GitHub Actions 自动验证
+	{"https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/http.txt", "http"},
+	{"https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/socks5.txt", "socks5"},
+	{"https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/socks4.txt", "socks5"},
+	// gfpcom/free-proxy-list - 每30分钟更新，超大量（protocol://ip:port 格式，解析器已支持）
+	{"https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/http.txt", "http"},
+	{"https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/socks5.txt", "socks5"},
 }
 
 // 所有源
 var allSources = append(fastUpdateSources, slowUpdateSources...)
 
 type Fetcher struct {
-	sources       []Source
 	client        *http.Client
 	sourceManager *SourceManager
+
+	recentMu   sync.Mutex
+	recentSeen map[string]time.Time
 }
 
 func New(httpURL, socks5URL string, sourceManager *SourceManager) *Fetcher {
 	return &Fetcher{
-		sources:       allSources,
 		sourceManager: sourceManager,
+		recentSeen:    make(map[string]time.Time),
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -116,7 +153,8 @@ func (f *Fetcher) FetchSmart(mode string, preferredProtocol string) ([]storage.P
 		return nil, fmt.Errorf("no available sources")
 	}
 
-	return f.fetchFromSources(sources)
+	skipDedup := mode == "emergency"
+	return f.fetchFromSources(sources, skipDedup)
 }
 
 // filterAvailableSources 过滤可用的源（通过断路器）
@@ -155,8 +193,8 @@ func (f *Fetcher) selectRandomSources(sources []Source, count int, preferredProt
 	return shuffled[:count]
 }
 
-// fetchFromSources 从指定源列表抓取
-func (f *Fetcher) fetchFromSources(sources []Source) ([]storage.Proxy, error) {
+// fetchFromSources 从指定源列表抓取。skipDedup 为 true 时跳过跨次去重（用于紧急模式）
+func (f *Fetcher) fetchFromSources(sources []Source, skipDedup ...bool) ([]storage.Proxy, error) {
 	type result struct {
 		proxies []storage.Proxy
 		source  Source
@@ -203,51 +241,51 @@ func (f *Fetcher) fetchFromSources(sources []Source) ([]storage.Proxy, error) {
 	if len(all) == 0 {
 		return nil, fmt.Errorf("no proxies fetched")
 	}
-	log.Printf("[fetch] 总共抓取: %d 个代理（去重后）", len(all))
-	return all, nil
+
+	// 紧急模式跳过跨次去重，确保能获取到候选代理
+	if len(skipDedup) > 0 && skipDedup[0] {
+		log.Printf("[fetch] 总共抓取: %d 个代理（紧急模式，跳过跨次去重）", len(all))
+		return all, nil
+	}
+
+	// 跨次短期去重：过滤掉最近 dedupTTL 内已抓取过的地址
+	f.recentMu.Lock()
+	now := time.Now()
+	// 清理过期条目
+	for addr, ts := range f.recentSeen {
+		if now.Sub(ts) > dedupTTL {
+			delete(f.recentSeen, addr)
+		}
+	}
+	var fresh []storage.Proxy
+	for _, p := range all {
+		if _, exists := f.recentSeen[p.Address]; !exists {
+			fresh = append(fresh, p)
+			f.recentSeen[p.Address] = now
+		}
+	}
+	dedupSkipped := len(all) - len(fresh)
+	f.recentMu.Unlock()
+
+	if dedupSkipped > 0 {
+		log.Printf("[fetch] 短期去重: 跳过 %d 个近 %v 内已见地址，剩余 %d 个新代理", dedupSkipped, dedupTTL, len(fresh))
+	}
+	log.Printf("[fetch] 总共抓取: %d 个代理（去重后）", len(fresh))
+
+	if len(fresh) == 0 {
+		return nil, fmt.Errorf("所有代理均在短期去重窗口内，无新代理")
+	}
+	return fresh, nil
 }
 
-// Fetch 从所有来源并发抓取代理
-func (f *Fetcher) Fetch() ([]storage.Proxy, error) {
-	type result struct {
-		proxies []storage.Proxy
-		source  Source
-		err     error
+// FetchFast 只从快速更新源抓取（用于定时主动补充）
+func (f *Fetcher) FetchFast() ([]storage.Proxy, error) {
+	sources := f.filterAvailableSources(fastUpdateSources, "", false)
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("no available fast sources")
 	}
-
-	ch := make(chan result, len(f.sources))
-	for _, src := range f.sources {
-		go func(s Source) {
-			proxies, err := f.fetchFromURL(s.URL, s.Protocol)
-			ch <- result{proxies: proxies, source: s, err: err}
-		}(src)
-	}
-
-	var all []storage.Proxy
-	seen := make(map[string]bool)
-	for range f.sources {
-		r := <-ch
-		if r.err != nil {
-			log.Printf("fetch %s error: %v", r.source.URL, r.err)
-			continue
-		}
-		// 去重
-		var deduped []storage.Proxy
-		for _, p := range r.proxies {
-			if !seen[p.Address] {
-				seen[p.Address] = true
-				deduped = append(deduped, p)
-			}
-		}
-		log.Printf("fetched %d %s proxies from %s", len(deduped), r.source.Protocol, r.source.URL)
-		all = append(all, deduped...)
-	}
-
-	if len(all) == 0 {
-		return nil, fmt.Errorf("no proxies fetched")
-	}
-	log.Printf("total fetched: %d proxies (deduped)", len(all))
-	return all, nil
+	log.Printf("[fetch] 主动拉取: 使用 %d 个快速源", len(sources))
+	return f.fetchFromSources(sources)
 }
 
 func (f *Fetcher) fetchFromURL(url, protocol string) ([]storage.Proxy, error) {

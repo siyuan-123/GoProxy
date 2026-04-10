@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,6 +53,17 @@ type Result struct {
 	Latency      time.Duration
 	ExitIP       string
 	ExitLocation string
+	HTTPSLatency time.Duration // Kiro/AWS HTTPS 探测延迟
+}
+
+var defaultHTTPSTestTargets = []string{
+	"https://q.us-east-1.amazonaws.com/",
+	"https://oidc.us-east-1.amazonaws.com/token",
+}
+
+var defaultHTTPSProbeHosts = map[string]struct{}{
+	"q.us-east-1.amazonaws.com":    {},
+	"oidc.us-east-1.amazonaws.com": {},
 }
 
 // getExitIPInfo 通过代理获取出口 IP 和地理位置
@@ -64,7 +77,7 @@ func getExitIPInfo(client *http.Client) (string, string) {
 
 	var result struct {
 		Status      string `json:"status"`
-		Query       string `json:"query"`       // IP 地址
+		Query       string `json:"query"` // IP 地址
 		Country     string `json:"country"`
 		CountryCode string `json:"countryCode"`
 		City        string `json:"city"`
@@ -79,54 +92,84 @@ func getExitIPInfo(client *http.Client) (string, string) {
 	if result.City != "" {
 		location = fmt.Sprintf("%s %s", result.CountryCode, result.City)
 	}
-	
+
 	return result.Query, location
 }
 
-// HTTPS 测试目标列表，随机选一个验证代理的 CONNECT 隧道能力
-var httpsTestTargets = []string{
-	"https://www.google.com",
-	"https://www.openai.com",
-	"https://www.github.com",
-	"https://www.cloudflare.com",
-	"https://httpbin.org/ip",
+func (v *Validator) httpsTestTargets() []string {
+	if v.cfg != nil && len(v.cfg.HTTPSTestTargets) > 0 {
+		return v.cfg.HTTPSTestTargets
+	}
+	return defaultHTTPSTestTargets
 }
 
-// checkHTTPSConnect 通过 HTTP 代理实际访问一个随机 HTTPS 网站，验证 CONNECT 隧道是否可用
-// 首次失败会换一个目标重试一次，避免目标网站偶尔抽风导致误杀
-func checkHTTPSConnect(proxyAddr string, timeout time.Duration) bool {
-	proxyURL, err := url.Parse(fmt.Sprintf("http://%s", proxyAddr))
-	if err != nil {
-		return false
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			Proxy:               http.ProxyURL(proxyURL),
-			TLSHandshakeTimeout: timeout,
-		},
-		Timeout: timeout,
+// checkHTTPSReachability 通过已构建好的代理客户端访问真实 HTTPS 目标，
+// 用于筛掉“能访问验证 URL，但对 AWS/Kiro 上游不稳定”的代理。
+// 首次失败会换一个目标重试一次，避免单个站点偶发抖动导致误杀。
+func checkHTTPSReachability(client *http.Client, targets []string) (bool, time.Duration) {
+	if len(targets) == 0 {
+		targets = defaultHTTPSTestTargets
 	}
 
 	// 随机起始索引
-	start := int(time.Now().UnixNano() % int64(len(httpsTestTargets)))
+	start := int(time.Now().UnixNano() % int64(len(targets)))
 
 	for attempt := 0; attempt < 2; attempt++ {
-		idx := (start + attempt) % len(httpsTestTargets)
-		resp, err := client.Get(httpsTestTargets[idx])
+		idx := (start + attempt) % len(targets)
+		req, err := http.NewRequest(http.MethodHead, targets[idx], nil)
+		if err != nil {
+			continue
+		}
+		probeStart := time.Now()
+		resp, err := client.Do(req)
+		probeLatency := time.Since(probeStart)
 		if err != nil {
 			continue
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
-		// 2xx 或 3xx 都算成功（部分网站会重定向）
-		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			return true
+		if isExpectedHTTPSProbeResponse(targets[idx], resp) {
+			return true, probeLatency
 		}
 	}
 
-	return false
+	return false, 0
+}
+
+func isExpectedHTTPSProbeResponse(target string, resp *http.Response) bool {
+	if resp.StatusCode == http.StatusProxyAuthRequired {
+		return false
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		return true
+	}
+
+	if resp.StatusCode == http.StatusMethodNotAllowed {
+		return true
+	}
+
+	if !isDefaultAWSProbeTarget(target) {
+		return false
+	}
+
+	switch resp.StatusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests:
+		return resp.Header.Get("x-amzn-requestid") != ""
+	default:
+		return false
+	}
+}
+
+func isDefaultAWSProbeTarget(target string) bool {
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	_, ok := defaultHTTPSProbeHosts[host]
+	return ok
 }
 
 // ValidateAll 并发验证所有代理，返回验证结果
@@ -151,8 +194,8 @@ func (v *Validator) ValidateStream(proxies []storage.Proxy) <-chan Result {
 			go func(px storage.Proxy) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				valid, latency, exitIP, exitLocation := v.ValidateOne(px)
-				ch <- Result{Proxy: px, Valid: valid, Latency: latency, ExitIP: exitIP, ExitLocation: exitLocation}
+				valid, latency, exitIP, exitLocation, httpsLatency := v.ValidateOne(px)
+				ch <- Result{Proxy: px, Valid: valid, Latency: latency, ExitIP: exitIP, ExitLocation: exitLocation, HTTPSLatency: httpsLatency}
 			}(p)
 		}
 		wg.Wait()
@@ -162,8 +205,8 @@ func (v *Validator) ValidateStream(proxies []storage.Proxy) <-chan Result {
 	return ch
 }
 
-// ValidateOne 验证单个代理是否可用，返回是否有效、延迟、出口IP和地理位置
-func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, string) {
+// ValidateOne 验证单个代理是否可用，返回是否有效、延迟、出口IP、地理位置、HTTPS探测延迟
+func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, string, time.Duration) {
 	var client *http.Client
 	var err error
 
@@ -174,40 +217,40 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 		client, err = newSOCKS5Client(p.Address, v.timeout)
 	default:
 		log.Printf("unknown protocol %s for %s", p.Protocol, p.Address)
-		return false, 0, "", ""
+		return false, 0, "", "", 0
 	}
 
 	if err != nil {
-		return false, 0, "", ""
+		return false, 0, "", "", 0
 	}
 
 	start := time.Now()
 	resp, err := client.Get(v.validateURL)
 	latency := time.Since(start)
 	if err != nil {
-		return false, 0, "", ""
+		return false, 0, "", "", 0
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 
 	// 验证状态码（200 或 204 都接受）
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return false, latency, "", ""
+		return false, latency, "", "", 0
 	}
 
 	// 响应时间过滤
 	if v.maxResponseMs > 0 && latency > time.Duration(v.maxResponseMs)*time.Millisecond {
-		return false, latency, "", ""
+		return false, latency, "", "", 0
 	}
 
 	// 获取出口 IP 和地理位置（仅在验证通过时）
 	exitIP, exitLocation := getExitIPInfo(client)
-	
+
 	// 必须能获取到出口信息
 	if exitIP == "" || exitLocation == "" {
-		return false, latency, exitIP, exitLocation
+		return false, latency, exitIP, exitLocation, 0
 	}
-	
+
 	// 地理过滤：白名单优先，否则走黑名单
 	if v.cfg != nil && len(exitLocation) >= 2 {
 		countryCode := exitLocation[:2]
@@ -221,26 +264,31 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 				}
 			}
 			if !allowed {
-				return false, latency, exitIP, exitLocation
+				return false, latency, exitIP, exitLocation, 0
 			}
 		} else if len(v.cfg.BlockedCountries) > 0 {
 			// 黑名单模式
 			for _, blocked := range v.cfg.BlockedCountries {
 				if countryCode == blocked {
-					return false, latency, exitIP, exitLocation
+					return false, latency, exitIP, exitLocation, 0
 				}
 			}
 		}
 	}
 
-	// HTTP 代理额外检测：必须支持 HTTPS CONNECT 隧道
-	if p.Protocol == "http" {
-		if !checkHTTPSConnect(p.Address, v.timeout) {
-			return false, latency, exitIP, exitLocation
-		}
+	// 所有代理都额外检测 Kiro/AWS 真实 HTTPS 目标，避免只对 gstatic 快、对 AWS 慢。
+	httpsOK, httpsLatency := checkHTTPSReachability(client, v.httpsTestTargets())
+	if !httpsOK {
+		return false, latency, exitIP, exitLocation, 0
 	}
 
-	return true, latency, exitIP, exitLocation
+	// Kiro HTTPS 延迟超过阈值的直接拒绝
+	cfg := config.Get()
+	if cfg != nil && cfg.KiroLatencyThreshold > 0 && httpsLatency > time.Duration(cfg.KiroLatencyThreshold)*time.Millisecond {
+		return false, latency, exitIP, exitLocation, httpsLatency
+	}
+
+	return true, latency, exitIP, exitLocation, httpsLatency
 }
 
 func newHTTPClient(address string, timeout time.Duration) (*http.Client, error) {
@@ -257,7 +305,7 @@ func newHTTPClient(address string, timeout time.Duration) (*http.Client, error) 
 }
 
 func newSOCKS5Client(address string, timeout time.Duration) (*http.Client, error) {
-	dialer, err := proxy.SOCKS5("tcp", address, nil, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", address, nil, &net.Dialer{Timeout: timeout})
 	if err != nil {
 		return nil, err
 	}
@@ -267,4 +315,68 @@ func newSOCKS5Client(address string, timeout time.Duration) (*http.Client, error
 		},
 		Timeout: timeout,
 	}, nil
+}
+
+// QuickCheckResult 快速检测结果
+type QuickCheckResult struct {
+	Proxy   storage.Proxy
+	Alive   bool
+	Latency time.Duration
+}
+
+// QuickCheckStream 并发快速连通性检测，只测 validateURL，不做 HTTPS/IP 探测
+func (v *Validator) QuickCheckStream(proxies []storage.Proxy) <-chan QuickCheckResult {
+	ch := make(chan QuickCheckResult, concurrencyBuffer(len(proxies), v.concurrency))
+	sem := make(chan struct{}, v.concurrency)
+	var wg sync.WaitGroup
+
+	go func() {
+		for _, p := range proxies {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(px storage.Proxy) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				alive, latency := v.quickCheckOne(px)
+				ch <- QuickCheckResult{Proxy: px, Alive: alive, Latency: latency}
+			}(p)
+		}
+		wg.Wait()
+		close(ch)
+	}()
+
+	return ch
+}
+
+// quickCheckOne 单个代理快速连通性检测
+func (v *Validator) quickCheckOne(p storage.Proxy) (bool, time.Duration) {
+	var client *http.Client
+	var err error
+
+	switch p.Protocol {
+	case "http":
+		client, err = newHTTPClient(p.Address, v.timeout)
+	case "socks5":
+		client, err = newSOCKS5Client(p.Address, v.timeout)
+	default:
+		return false, 0
+	}
+
+	if err != nil {
+		return false, 0
+	}
+
+	start := time.Now()
+	resp, err := client.Get(v.validateURL)
+	latency := time.Since(start)
+	if err != nil {
+		return false, 0
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+		return true, latency
+	}
+	return false, latency
 }
