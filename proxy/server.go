@@ -137,10 +137,29 @@ func (s *Server) selectProxy(tried []string, lowestLatency bool, targetHost stri
 
 	// 关键主机感知：只使用 S/A 级 + kiro_validated 的代理
 	if cfg.IsCriticalHost(targetHost) {
-		p, err := s.selectCriticalProxy(tried, sourceFilter, cfg, avoidExits)
-		if err == nil {
-			updateLastExit(p.ExitIP)
-			return p, nil
+		// 混用 + 优先模式下，关键主机也优先从优先源选取
+		if cfg.CustomProxyMode == "mixed" && (cfg.CustomPriority || cfg.CustomFreePriority) {
+			preferSource := "custom"
+			if cfg.CustomFreePriority {
+				preferSource = "free"
+			}
+			p, err := s.selectCriticalProxy(tried, preferSource, cfg, avoidExits)
+			if err == nil {
+				updateLastExit(p.ExitIP)
+				return p, nil
+			}
+			// 优先源无关键代理，fallback 到全部关键代理
+			p, err = s.selectCriticalProxy(tried, "", cfg, avoidExits)
+			if err == nil {
+				updateLastExit(p.ExitIP)
+				return p, nil
+			}
+		} else {
+			p, err := s.selectCriticalProxy(tried, sourceFilter, cfg, avoidExits)
+			if err == nil {
+				updateLastExit(p.ExitIP)
+				return p, nil
+			}
 		}
 		log.Printf("[proxy] 关键主机 %s 无专属代理可用，降级到常规选取", targetHost)
 	}

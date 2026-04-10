@@ -181,10 +181,27 @@ func (s *SOCKS5Server) selectSOCKS5Proxy(tried []string, targetHost string) (*st
 
 	// 关键主机感知：只使用 S/A 级 + kiro_validated 的 SOCKS5 代理
 	if cfg.IsCriticalHost(targetHost) {
-		p, err := s.selectCriticalSOCKS5Proxy(tried, sourceFilter, avoidExits)
-		if err == nil {
-			updateLastExit(p.ExitIP)
-			return p, nil
+		if cfg.CustomProxyMode == "mixed" && (cfg.CustomPriority || cfg.CustomFreePriority) {
+			preferSource := "custom"
+			if cfg.CustomFreePriority {
+				preferSource = "free"
+			}
+			p, err := s.selectCriticalSOCKS5Proxy(tried, preferSource, avoidExits)
+			if err == nil {
+				updateLastExit(p.ExitIP)
+				return p, nil
+			}
+			p, err = s.selectCriticalSOCKS5Proxy(tried, "", avoidExits)
+			if err == nil {
+				updateLastExit(p.ExitIP)
+				return p, nil
+			}
+		} else {
+			p, err := s.selectCriticalSOCKS5Proxy(tried, sourceFilter, avoidExits)
+			if err == nil {
+				updateLastExit(p.ExitIP)
+				return p, nil
+			}
 		}
 		log.Printf("[socks5] 关键主机 %s 无专属代理可用，降级到常规选取", targetHost)
 	}
