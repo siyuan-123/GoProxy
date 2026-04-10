@@ -141,7 +141,7 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 
 		s.storage.RecordProxyUse(p.Address, true)
 		s.storage.ResetConsecutiveFails(p.Address)
-		log.Printf("[socks5] %s via %s established (%dms)", target, p.Address, dialMs)
+		log.Printf("[socks5] %s via %s [exit:%s] established (%dms)", target, p.Address, p.ExitIP, dialMs)
 
 		// 双向转发数据（带空闲超时保护）
 		s.relaySOCKS5Tunnel(upstreamConn, clientConn, p, target)

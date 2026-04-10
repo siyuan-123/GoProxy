@@ -333,9 +333,9 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		s.storage.RecordProxyUse(p.Address, true)
 		s.storage.ResetConsecutiveFails(p.Address)
 		if resp.StatusCode == 429 {
-			log.Printf("[proxy] ⚠️  429 %s via %s (protocol=%s)", r.RequestURI, p.Address, p.Protocol)
+			log.Printf("[proxy] ⚠️  429 %s via %s [exit:%s] (protocol=%s)", r.RequestURI, p.Address, p.ExitIP, p.Protocol)
 		} else {
-			log.Printf("[proxy] %s via %s -> %d", r.RequestURI, p.Address, resp.StatusCode)
+			log.Printf("[proxy] %s via %s [exit:%s] -> %d", r.RequestURI, p.Address, p.ExitIP, resp.StatusCode)
 		}
 		return
 	}
@@ -386,7 +386,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 
 		fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
-		log.Printf("[tunnel] %s via %s established (%dms)", r.Host, p.Address, dialMs)
+		log.Printf("[tunnel] %s via %s [exit:%s] established (%dms)", r.Host, p.Address, p.ExitIP, dialMs)
 
 		// 双向转发（带空闲超时保护）
 		go s.relayTunnel(conn, clientConn, p, r.Host)
