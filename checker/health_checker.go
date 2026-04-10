@@ -57,7 +57,8 @@ func (hc *HealthChecker) RunOnce() {
 			if err := hc.storage.UpdateExitInfo(result.Proxy.Address, result.ExitIP, result.ExitLocation, latencyMs); err == nil {
 				updateCount++
 			}
-			// 健康检查通过也重置连续失败计数
+			// 健康检查通过：重置 fail_count 和 consecutive_fails，让恢复的代理重新可用
+			hc.storage.ResetFail(result.Proxy.Address)
 			hc.storage.ResetConsecutiveFails(result.Proxy.Address)
 			// 更新 Kiro 验证信息（如果 HTTPS 探测有延迟数据）
 			if result.HTTPSLatency > 0 {

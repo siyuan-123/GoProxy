@@ -491,7 +491,8 @@ func (s *Server) relayTunnel(upstream, client net.Conn, p *storage.Proxy, host s
 
 	if timedOut {
 		log.Printf("[tunnel] ⏰ %s via %s 空闲超时 (>%ds)，代理异常，记录失败", host, p.Address, cfg.TunnelIdleTimeout)
-		s.storage.RecordProxyUse(p.Address, false)
+		// 不再调用 RecordProxyUse(false)，因为建连时已计为一次成功使用，
+		// 避免同一连接被双重计数（use_count 虚高）
 		s.handleProxyFailure(p, cfg)
 	}
 }

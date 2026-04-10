@@ -408,9 +408,9 @@ func selectRotationCandidates(proxies []Proxy) []Proxy {
 		candidates = usable
 	}
 
-	// Keep the fast half of the pool, capped, so rotation stays diverse but not noisy.
-	latencyWindow := len(candidates) / 2
-	if latencyWindow < 6 {
+	// 取延迟较低的 2/3 候选，保证轮换多样性的同时兼顾延迟质量
+	latencyWindow := len(candidates) * 2 / 3
+	if latencyWindow < 18 {
 		latencyWindow = len(candidates)
 	}
 	if latencyWindow > 40 {
