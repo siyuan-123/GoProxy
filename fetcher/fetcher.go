@@ -13,7 +13,7 @@ import (
 	"goproxy/storage"
 )
 
-const dedupTTL = 24 * time.Hour
+const dedupTTL = 1 * time.Hour
 
 // 代理来源定义
 type Source struct {
