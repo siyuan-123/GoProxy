@@ -272,7 +272,16 @@ func (s *Storage) AddProxy(address, protocol string) error {
 	// 检查是否真的插入了
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
-		log.Printf("[storage] AddProxy %s ignored (already exists or constraint)", address)
+		// 已存在：重置失败状态，让坏记录复活
+		_, err = s.db.Exec(
+			`UPDATE proxies SET fail_count = 0, consecutive_fails = 0, status = 'active' WHERE address = ? AND (fail_count > 0 OR status != 'active')`,
+			address,
+		)
+		if err != nil {
+			log.Printf("[storage] AddProxy %s reset fail state error: %v", address, err)
+			return err
+		}
+		log.Printf("[storage] AddProxy %s already exists, reset fail state", address)
 	}
 	return nil
 }
@@ -283,16 +292,31 @@ func (s *Storage) AddProxies(proxies []Proxy) error {
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO proxies (address, protocol) VALUES (?, ?)`)
+	insertStmt, err := tx.Prepare(`INSERT OR IGNORE INTO proxies (address, protocol) VALUES (?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return err
 	}
-	defer stmt.Close()
+	defer insertStmt.Close()
+
+	resetStmt, err := tx.Prepare(`UPDATE proxies SET fail_count = 0, consecutive_fails = 0, status = 'active' WHERE address = ? AND (fail_count > 0 OR status != 'active')`)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer resetStmt.Close()
 
 	for _, p := range proxies {
-		if _, err := stmt.Exec(p.Address, p.Protocol); err != nil {
+		result, err := insertStmt.Exec(p.Address, p.Protocol)
+		if err != nil {
 			log.Printf("insert proxy %s error: %v", p.Address, err)
+			continue
+		}
+		affected, _ := result.RowsAffected()
+		if affected == 0 {
+			if _, err := resetStmt.Exec(p.Address); err != nil {
+				log.Printf("reset proxy %s fail state error: %v", p.Address, err)
+			}
 		}
 	}
 	return tx.Commit()
@@ -1258,8 +1282,8 @@ func (s *Storage) AddProxyWithSource(address, protocol, source string, subscript
 	}
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
-		// 已存在，更新 source 和 subscription_id
-		_, err = s.db.Exec(`UPDATE proxies SET source = ?, subscription_id = ? WHERE address = ?`, source, subID, address)
+		// 已存在，更新 source/subscription_id 并重置失败状态
+		_, err = s.db.Exec(`UPDATE proxies SET source = ?, subscription_id = ?, fail_count = 0, consecutive_fails = 0, status = 'active' WHERE address = ?`, source, subID, address)
 	}
 	return err
 }
