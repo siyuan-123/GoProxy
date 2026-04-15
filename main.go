@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"math/rand"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,29 @@ import (
 
 var fetchRunning atomic.Bool
 var fetchMu sync.Mutex
+
+// 候选缓存：保存一轮抓取的全部候选，分批验证，确保所有候选都被处理
+type candidateCache struct {
+	httpCandidates   []storage.Proxy
+	socks5Candidates []storage.Proxy
+	httpOffset       int
+	socks5Offset     int
+}
+
+// exhausted 判断缓存是否全部处理完毕（或为空）
+func (c *candidateCache) exhausted() bool {
+	return c.httpOffset >= len(c.httpCandidates) && c.socks5Offset >= len(c.socks5Candidates)
+}
+
+// reset 清空缓存，准备下一轮抓取
+func (c *candidateCache) reset() {
+	c.httpCandidates = nil
+	c.socks5Candidates = nil
+	c.httpOffset = 0
+	c.socks5Offset = 0
+}
+
+var candCache candidateCache
 
 func main() {
 	// 初始化日志收集器
@@ -82,13 +106,13 @@ func main() {
 		totalDeleted += int(deleted)
 	}
 	
-	// 创建 HTTP 代理服务器：随机轮换 + 最低延迟
-	randomServer := proxy.New(store, cfg, "random", cfg.ProxyPort)
-	stableServer := proxy.New(store, cfg, "lowest-latency", cfg.StableProxyPort)
+	// 创建 HTTP 代理服务器：随机轮换 + 最低延迟（传入 poolMgr 用于 warm 池即时提升）
+	randomServer := proxy.New(store, cfg, "random", cfg.ProxyPort, poolMgr)
+	stableServer := proxy.New(store, cfg, "lowest-latency", cfg.StableProxyPort, poolMgr)
 	
 	// 创建 SOCKS5 代理服务器：随机轮换 + 最低延迟
-	socks5RandomServer := proxy.NewSOCKS5(store, cfg, "random", cfg.SOCKS5Port)
-	socks5StableServer := proxy.NewSOCKS5(store, cfg, "lowest-latency", cfg.StableSOCKS5Port)
+	socks5RandomServer := proxy.NewSOCKS5(store, cfg, "random", cfg.SOCKS5Port, poolMgr)
+	socks5StableServer := proxy.NewSOCKS5(store, cfg, "lowest-latency", cfg.StableSOCKS5Port, poolMgr)
 
 	// 初始化订阅管理器
 	customMgr := custom.NewManager(store, validate, cfg)
@@ -98,7 +122,7 @@ func main() {
 
 	// 启动 WebUI（传递池子管理器和订阅管理器）
 	ui := webui.New(store, cfg, poolMgr, customMgr, func() {
-		go smartFetchAndFill(fetch, validate, store, poolMgr)
+		go smartFetchAndFill(fetch, validate, store, poolMgr, true)
 	}, configChanged)
 	ui.Start()
 
@@ -109,8 +133,11 @@ func main() {
 		} else {
 			log.Println("[main] 🚀 启动初始化填充...")
 		}
-		smartFetchAndFill(fetch, validate, store, poolMgr)
+		smartFetchAndFill(fetch, validate, store, poolMgr, false)
 	}()
+
+	// 启动 warm→active 自动提升协程
+	go startWarmPromoter(poolMgr)
 
 	// 启动状态监控协程
 	go startStatusMonitor(poolMgr, fetch, validate, store)
@@ -157,14 +184,21 @@ func main() {
 	}
 }
 
-// smartFetchAndFill 智能抓取和填充
-func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, store *storage.Storage, poolMgr *pool.Manager) {
+// smartFetchAndFill 智能抓取和填充。forceRefetch=true 时清空候选缓存强制重新抓取。
+func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, store *storage.Storage, poolMgr *pool.Manager, forceRefetch bool) {
 	// 防止并发执行
 	if !fetchRunning.CompareAndSwap(false, true) {
 		log.Println("[main] 抓取已在运行，跳过")
 		return
 	}
 	defer fetchRunning.Store(false)
+
+	if forceRefetch && !candCache.exhausted() {
+		log.Printf("[main] 强制重新抓取，丢弃缓存剩余（HTTP %d/%d, SOCKS5 %d/%d）",
+			len(candCache.httpCandidates)-candCache.httpOffset, len(candCache.httpCandidates),
+			len(candCache.socks5Candidates)-candCache.socks5Offset, len(candCache.socks5Candidates))
+		candCache.reset()
+	}
 
 	// 获取池子状态
 	status, err := poolMgr.GetStatus()
@@ -173,38 +207,80 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 		return
 	}
 
-	log.Printf("[main] 📊 池子状态: %s | HTTP=%d/%d SOCKS5=%d/%d 总计=%d/%d",
+	log.Printf("[main] 📊 池子状态: %s | HTTP=%d/%d SOCKS5=%d/%d 总计=%d/%d | warm: HTTP=%d SOCKS5=%d",
 		status.State, status.HTTP, status.HTTPSlots, status.SOCKS5, status.SOCKS5Slots,
-		status.Total, config.Get().PoolMaxSize)
+		status.Total, config.Get().PoolMaxSize, status.WarmHTTP, status.WarmSOCKS5)
 
-	// 判断是否需要抓取
-	needFetch, mode, preferredProtocol := poolMgr.NeedsFetch(status)
-	if !needFetch {
-		log.Println("[main] 池子健康，无需抓取")
-		return
+	cfg := config.Get()
+	maxPerProto := cfg.MaxCandidatesPerProtocol
+	if maxPerProto <= 0 {
+		maxPerProto = 3000
 	}
 
-	log.Printf("[main] 🔍 智能抓取: 模式=%s 协议偏好=%s", mode, preferredProtocol)
+	if candCache.exhausted() {
+		// 缓存为空或已用完，判断是否需要重新抓取
+		needFetch, mode, preferredProtocol := poolMgr.NeedsFetch(status)
+		if !needFetch {
+			log.Println("[main] 池子健康，无需抓取")
+			return
+		}
 
-	// 智能抓取
-	candidates, err := fetch.FetchSmart(mode, preferredProtocol)
-	if err != nil {
-		log.Printf("[main] 抓取失败: %v", err)
-		return
-	}
+		log.Printf("[main] 🔍 智能抓取: 模式=%s 协议偏好=%s", mode, preferredProtocol)
 
-	// 按协议分组
-	var httpCandidates, socks5Candidates []storage.Proxy
-	for _, c := range candidates {
-		if c.Protocol == "http" {
-			httpCandidates = append(httpCandidates, c)
-		} else {
-			socks5Candidates = append(socks5Candidates, c)
+		candidates, err := fetch.FetchSmart(mode, preferredProtocol)
+		if err != nil {
+			log.Printf("[main] 抓取失败: %v", err)
+			return
+		}
+
+		// 填充缓存，打乱顺序确保各批次来源多样
+		candCache.reset()
+		for _, c := range candidates {
+			if c.Protocol == "http" {
+				candCache.httpCandidates = append(candCache.httpCandidates, c)
+			} else {
+				candCache.socks5Candidates = append(candCache.socks5Candidates, c)
+			}
+		}
+		rand.Shuffle(len(candCache.httpCandidates), func(i, j int) {
+			candCache.httpCandidates[i], candCache.httpCandidates[j] = candCache.httpCandidates[j], candCache.httpCandidates[i]
+		})
+		rand.Shuffle(len(candCache.socks5Candidates), func(i, j int) {
+			candCache.socks5Candidates[i], candCache.socks5Candidates[j] = candCache.socks5Candidates[j], candCache.socks5Candidates[i]
+		})
+
+		log.Printf("[main] 📦 缓存新一轮候选: HTTP=%d SOCKS5=%d，每批上限 %d",
+			len(candCache.httpCandidates), len(candCache.socks5Candidates), maxPerProto)
+	} else {
+		// 缓存有剩余候选，检查池子是否还需要
+		needFetch, _, _ := poolMgr.NeedsFetch(status)
+		if !needFetch {
+			log.Printf("[main] 池子健康，暂停处理缓存（HTTP %d/%d, SOCKS5 %d/%d）",
+				candCache.httpOffset, len(candCache.httpCandidates),
+				candCache.socks5Offset, len(candCache.socks5Candidates))
+			return
 		}
 	}
 
-	log.Printf("[main] 抓取到 %d 个候选代理（SOCKS5=%d HTTP=%d），按协议并发验证...",
-		len(candidates), len(socks5Candidates), len(httpCandidates))
+	// 从缓存取下一批候选
+	httpEnd := candCache.httpOffset + maxPerProto
+	if httpEnd > len(candCache.httpCandidates) {
+		httpEnd = len(candCache.httpCandidates)
+	}
+	httpBatch := candCache.httpCandidates[candCache.httpOffset:httpEnd]
+	candCache.httpOffset = httpEnd
+
+	socks5End := candCache.socks5Offset + maxPerProto
+	if socks5End > len(candCache.socks5Candidates) {
+		socks5End = len(candCache.socks5Candidates)
+	}
+	socks5Batch := candCache.socks5Candidates[candCache.socks5Offset:socks5End]
+	candCache.socks5Offset = socks5End
+
+	log.Printf("[main] 本批验证: HTTP=%d SOCKS5=%d | 缓存进度: HTTP %d/%d SOCKS5 %d/%d",
+		len(httpBatch), len(socks5Batch),
+		candCache.httpOffset, len(candCache.httpCandidates),
+		candCache.socks5Offset, len(candCache.socks5Candidates))
 
 	// 共享计数器
 	var addedCount atomic.Int32
@@ -269,12 +345,12 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 	var wg sync.WaitGroup
 
 	// SOCKS5 协程：验证快，优先填充
-	if len(socks5Candidates) > 0 {
+	if len(socks5Batch) > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			count := 0
-			for result := range validate.ValidateStream(socks5Candidates) {
+			for result := range validate.ValidateStream(socks5Batch) {
 				processResult(result)
 				count++
 				if count%20 == 0 && poolFilled() {
@@ -287,12 +363,12 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 	}
 
 	// HTTP 协程：有额外 HTTPS 检测，较慢
-	if len(httpCandidates) > 0 {
+	if len(httpBatch) > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			count := 0
-			for result := range validate.ValidateStream(httpCandidates) {
+			for result := range validate.ValidateStream(httpBatch) {
 				processResult(result)
 				count++
 				if count%20 == 0 && poolFilled() {
@@ -308,10 +384,54 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 
 	// 最终状态
 	finalStatus, _ := poolMgr.GetStatus()
-	log.Printf("[main] 填充完成: 验证%d 通过%d 入池%d | 拒绝[无出口:%d 延迟:%d 地理:%d 满:%d] | 最终: %s HTTP=%d SOCKS5=%d",
-		len(candidates), validCount.Load(), addedCount.Load(),
+	log.Printf("[main] 本批完成: 验证%d 通过%d 入池%d | 拒绝[无出口:%d 延迟:%d 地理:%d 满:%d] | 最终: %s HTTP=%d SOCKS5=%d | warm: HTTP=%d SOCKS5=%d",
+		len(httpBatch)+len(socks5Batch), validCount.Load(), addedCount.Load(),
 		rejectedNoExit.Load(), rejectedLatency.Load(), rejectedGeo.Load(), rejectedFull.Load(),
-		finalStatus.State, finalStatus.HTTP, finalStatus.SOCKS5)
+		finalStatus.State, finalStatus.HTTP, finalStatus.SOCKS5, finalStatus.WarmHTTP, finalStatus.WarmSOCKS5)
+
+	// 检查本轮是否全部处理完毕
+	if candCache.exhausted() {
+		log.Printf("[main] ✅ 本轮全部候选处理完毕（HTTP=%d SOCKS5=%d），下次将重新抓取",
+			len(candCache.httpCandidates), len(candCache.socks5Candidates))
+		candCache.reset()
+	} else {
+		log.Printf("[main] 📋 缓存剩余: HTTP %d/%d SOCKS5 %d/%d，下次补池继续处理",
+			len(candCache.httpCandidates)-candCache.httpOffset, len(candCache.httpCandidates),
+			len(candCache.socks5Candidates)-candCache.socks5Offset, len(candCache.socks5Candidates))
+	}
+}
+
+// startWarmPromoter 定期检查 active 池是否掉量，自动从 warm 池提升
+// 健康时 10s 一次，critical/emergency 时加速到 2s
+func startWarmPromoter(poolMgr *pool.Manager) {
+	log.Println("[warm] warm→active 自动提升器已启动（正常10s/紧急2s）")
+
+	normalInterval := 10 * time.Second
+	urgentInterval := 2 * time.Second
+	ticker := time.NewTicker(normalInterval)
+	currentInterval := normalInterval
+
+	for range ticker.C {
+		promoted := poolMgr.PromoteIfNeeded()
+		if promoted > 0 {
+			log.Printf("[warm] 本轮从 warm 池提升 %d 个代理到 active", promoted)
+		}
+
+		// 根据池子状态动态调整检查频率
+		status, err := poolMgr.GetStatus()
+		if err == nil {
+			var targetInterval time.Duration
+			if status.State == "emergency" || status.State == "critical" {
+				targetInterval = urgentInterval
+			} else {
+				targetInterval = normalInterval
+			}
+			if targetInterval != currentInterval {
+				ticker.Reset(targetInterval)
+				currentInterval = targetInterval
+			}
+		}
+	}
 }
 
 // startProactiveFetch 每 5 分钟主动从快速源拉取新代理，替换池中差代理
@@ -407,7 +527,7 @@ func startStatusMonitor(poolMgr *pool.Manager, fetch *fetcher.Fetcher, validate 
 			log.Printf("[monitor] ⚠️  检测到池子需求: 状态=%s 模式=%s 协议=%s",
 				status.State, mode, preferredProtocol)
 			// 触发智能填充
-			go smartFetchAndFill(fetch, validate, store, poolMgr)
+			go smartFetchAndFill(fetch, validate, store, poolMgr, false)
 		}
 	}
 }

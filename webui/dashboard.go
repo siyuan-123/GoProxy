@@ -289,6 +289,24 @@ tr:hover{background:var(--gray-2);box-shadow:inset 0 0 20px rgba(0,255,65,0.05)}
         </div>
       </div>
 
+      <!-- warm 备用池 -->
+      <div style="font-size:8px;color:var(--cyan);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:2px;font-weight:600">[ WARM_POOL ]</div>
+      <div class="health-grid" style="grid-template-columns:repeat(3,1fr)">
+        <div class="health-card">
+          <div class="health-label">Warm</div>
+          <div class="health-value" id="stat-warm-total">0</div>
+          <div class="health-meta">已验证备用</div>
+        </div>
+        <div class="health-card">
+          <div class="health-label">HTTP</div>
+          <div class="health-value" id="stat-warm-http">0</div>
+        </div>
+        <div class="health-card">
+          <div class="health-label">SOCKS5</div>
+          <div class="health-value" id="stat-warm-socks5">0</div>
+        </div>
+      </div>
+
       <!-- 订阅代理池 -->
       <div style="font-size:8px;color:var(--yellow);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:2px;font-weight:600" data-i18n="health.sub_pool">[ SUBSCRIPTION_POOL ]</div>
       <div class="health-grid" style="grid-template-columns:repeat(3,1fr)">
@@ -1023,6 +1041,11 @@ async function loadPoolStatus() {
   const stateText = t('health.state.' + status.State.toLowerCase());
   stateEl.textContent = stateText.toUpperCase();
   dotEl.className = 'health-status ' + status.State.toLowerCase();
+
+  // warm 池
+  document.getElementById('stat-warm-total').textContent = status.WarmTotal || 0;
+  document.getElementById('stat-warm-http').textContent = status.WarmHTTP || 0;
+  document.getElementById('stat-warm-socks5').textContent = status.WarmSOCKS5 || 0;
 }
 
 async function loadQualityDistribution() {

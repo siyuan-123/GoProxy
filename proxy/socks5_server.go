@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"goproxy/config"
+	"goproxy/pool"
 	"goproxy/storage"
 )
 
@@ -41,22 +42,27 @@ func (s *SOCKS5Server) relaySOCKS5Tunnel(upstream, client net.Conn, p *storage.P
 
 // SOCKS5Server SOCKS5 协议服务器
 type SOCKS5Server struct {
-	storage         *storage.Storage
-	cfg             *config.Config
-	mode            string // "random" 或 "lowest-latency"
-	port            string
+	storage     *storage.Storage
+	cfg         *config.Config
+	poolMgr     *pool.Manager
+	mode        string // "random" 或 "lowest-latency"
+	port        string
 	mu          sync.Mutex
 	recentExits []string
 }
 
 // NewSOCKS5 创建 SOCKS5 服务器
-func NewSOCKS5(s *storage.Storage, cfg *config.Config, mode string, port string) *SOCKS5Server {
-	return &SOCKS5Server{
+func NewSOCKS5(s *storage.Storage, cfg *config.Config, mode string, port string, pm ...*pool.Manager) *SOCKS5Server {
+	srv := &SOCKS5Server{
 		storage: s,
 		cfg:     cfg,
 		mode:    mode,
 		port:    port,
 	}
+	if len(pm) > 0 {
+		srv.poolMgr = pm[0]
+	}
+	return srv
 }
 
 // Start 启动 SOCKS5 服务器
@@ -293,16 +299,27 @@ func (s *SOCKS5Server) selectCriticalSOCKS5Proxy(tried []string, sourceFilter st
 	return nil, fmt.Errorf("all critical socks5 proxies tried")
 }
 
-// handleSOCKS5ProxyFailure 处理 SOCKS5 代理失败
+// handleSOCKS5ProxyFailure 处理 SOCKS5 代理失败：渐进式降级策略
 func (s *SOCKS5Server) handleSOCKS5ProxyFailure(p *storage.Proxy, cfg *config.Config) {
 	count, err := s.storage.IncrementConsecutiveFails(p.Address)
 	if err != nil {
 		removeOrDisableProxy(s.storage, p)
+		s.tryPromoteFromWarm()
 		return
 	}
 	if count >= cfg.ConsecutiveFailThreshold {
 		log.Printf("[socks5] 代理 %s 连续失败 %d 次，踢出池子", p.Address, count)
 		removeOrDisableProxy(s.storage, p)
+		s.tryPromoteFromWarm()
+	} else {
+		s.storage.MarkDegraded(p.Address)
+	}
+}
+
+// tryPromoteFromWarm 代理被移除后，立即尝试从 warm 池提升补位
+func (s *SOCKS5Server) tryPromoteFromWarm() {
+	if s.poolMgr != nil {
+		go s.poolMgr.PromoteIfNeeded()
 	}
 }
 

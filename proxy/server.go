@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"goproxy/config"
+	"goproxy/pool"
 	"goproxy/storage"
 
 	"golang.org/x/net/proxy"
@@ -27,19 +28,24 @@ const maxRecentExits = 20
 type Server struct {
 	storage     *storage.Storage
 	cfg         *config.Config
+	poolMgr     *pool.Manager
 	mode        string // "random" 或 "lowest-latency"
 	port        string
 	mu          sync.Mutex
 	recentExits []string
 }
 
-func New(s *storage.Storage, cfg *config.Config, mode string, port string) *Server {
-	return &Server{
+func New(s *storage.Storage, cfg *config.Config, mode string, port string, pm ...*pool.Manager) *Server {
+	srv := &Server{
 		storage: s,
 		cfg:     cfg,
 		mode:    mode,
 		port:    port,
 	}
+	if len(pm) > 0 {
+		srv.poolMgr = pm[0]
+	}
+	return srv
 }
 
 func (s *Server) Start() error {
@@ -252,16 +258,29 @@ func (s *Server) selectCriticalProxy(tried []string, sourceFilter string, cfg *c
 	return nil, fmt.Errorf("all critical proxies tried")
 }
 
-// handleProxyFailure 处理代理失败：增加连续失败计数，达阈值则踢出
+// handleProxyFailure 处理代理失败：渐进式降级策略
+// 第 1/2 次失败：标记 degraded，降低选择优先级
+// 第 3 次（达阈值）：免费代理删除，订阅代理禁用；随后立即从 warm 池提升补位
 func (s *Server) handleProxyFailure(p *storage.Proxy, cfg *config.Config) {
 	count, err := s.storage.IncrementConsecutiveFails(p.Address)
 	if err != nil {
 		removeOrDisableProxy(s.storage, p)
+		s.tryPromoteFromWarm()
 		return
 	}
 	if count >= cfg.ConsecutiveFailThreshold {
 		log.Printf("[proxy] 代理 %s 连续失败 %d 次，踢出池子", p.Address, count)
 		removeOrDisableProxy(s.storage, p)
+		s.tryPromoteFromWarm()
+	} else {
+		s.storage.MarkDegraded(p.Address)
+	}
+}
+
+// tryPromoteFromWarm 代理被移除后，立即尝试从 warm 池提升补位
+func (s *Server) tryPromoteFromWarm() {
+	if s.poolMgr != nil {
+		go s.poolMgr.PromoteIfNeeded()
 	}
 }
 
@@ -301,7 +320,8 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 		client, err := s.buildClient(p)
 		if err != nil {
-			removeOrDisableProxy(s.storage, p)
+			s.storage.RecordProxyUse(p.Address, false)
+			s.handleProxyFailure(p, cfg)
 			continue
 		}
 

@@ -555,7 +555,7 @@ func (s *Storage) GetAllFiltered(sourceFilter string) ([]Proxy, error) {
 		query += ` AND source = ?`
 		args = append(args, sourceFilter)
 	}
-	query += ` ORDER BY latency ASC`
+	query += ` ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, consecutive_fails ASC, fail_count ASC, latency ASC`
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -866,10 +866,19 @@ func (s *Storage) IncrementConsecutiveFails(address string) (int, error) {
 	return count, err
 }
 
-// ResetConsecutiveFails 重置连续失败次数（成功时调用）
+// ResetConsecutiveFails 重置连续失败次数并恢复 degraded→active（成功时调用）
 func (s *Storage) ResetConsecutiveFails(address string) error {
 	_, err := s.db.Exec(
-		`UPDATE proxies SET consecutive_fails = 0 WHERE address = ?`,
+		`UPDATE proxies SET consecutive_fails = 0, status = CASE WHEN status = 'degraded' THEN 'active' ELSE status END WHERE address = ?`,
+		address,
+	)
+	return err
+}
+
+// MarkDegraded 将代理标记为降级状态（仅 active→degraded，不影响 disabled 等其他状态）
+func (s *Storage) MarkDegraded(address string) error {
+	_, err := s.db.Exec(
+		`UPDATE proxies SET status = 'degraded' WHERE address = ? AND status = 'active'`,
 		address,
 	)
 	return err
@@ -1246,7 +1255,7 @@ func (s *Storage) GetByProtocol(protocol string) ([]Proxy, error) {
 		`SELECT `+proxyColumns+`
 		 FROM proxies
 		 WHERE status IN ('active', 'degraded') AND fail_count < 3 AND protocol = ?
-		 ORDER BY latency ASC`, protocol,
+		 ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, consecutive_fails ASC, fail_count ASC, latency ASC`, protocol,
 	)
 	if err != nil {
 		return nil, err
@@ -1567,6 +1576,100 @@ func scanSubscription(rows *sql.Rows) (*Subscription, error) {
 	}
 	sub.Contributed = contributed == 1
 	return sub, nil
+}
+
+// ========== Warm 池（备用层）相关方法 ==========
+
+// AddProxyWarm 将已验证代理加入 warm 池（active 满时调用）
+func (s *Storage) AddProxyWarm(address, protocol, source string) error {
+	result, err := s.db.Exec(
+		`INSERT OR IGNORE INTO proxies (address, protocol, source, status) VALUES (?, ?, ?, 'warm')`,
+		address, protocol, source,
+	)
+	if err != nil {
+		return err
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		// 已存在：如果是 disabled/degraded 状态，可以更新为 warm
+		_, err = s.db.Exec(
+			`UPDATE proxies SET status = 'warm', fail_count = 0, consecutive_fails = 0
+			 WHERE address = ? AND status IN ('disabled', 'degraded')`,
+			address,
+		)
+	}
+	return err
+}
+
+// PromoteWarmToActive 从 warm 池提升指定数量的代理到 active（按延迟排序）
+func (s *Storage) PromoteWarmToActive(protocol string, count int) (int64, error) {
+	query := `UPDATE proxies SET status = 'active'
+		WHERE id IN (
+			SELECT id FROM proxies
+			WHERE status = 'warm' AND protocol = ?
+			ORDER BY consecutive_fails ASC, fail_count ASC, latency ASC
+			LIMIT ?
+		)`
+	res, err := s.db.Exec(query, protocol, count)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// CountWarm 统计 warm 池总数
+func (s *Storage) CountWarm() (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM proxies WHERE status = 'warm'`).Scan(&count)
+	return count, err
+}
+
+// CountWarmByProtocol 按协议统计 warm 池数量
+func (s *Storage) CountWarmByProtocol(protocol string) (int, error) {
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM proxies WHERE status = 'warm' AND protocol = ?`, protocol,
+	).Scan(&count)
+	return count, err
+}
+
+// GetWarmProxies 获取 warm 池代理（健康检查用）
+func (s *Storage) GetWarmProxies(limit int) ([]Proxy, error) {
+	query := `SELECT ` + proxyColumns + `
+		FROM proxies
+		WHERE status = 'warm'
+		ORDER BY COALESCE(last_check, '1970-01-01') ASC`
+	var rows *sql.Rows
+	var err error
+	if limit > 0 {
+		query += ` LIMIT ?`
+		rows, err = s.db.Query(query, limit)
+	} else {
+		rows, err = s.db.Query(query)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var proxies []Proxy
+	for rows.Next() {
+		p, err := scanProxy(rows)
+		if err != nil {
+			return nil, err
+		}
+		proxies = append(proxies, *p)
+	}
+	return proxies, nil
+}
+
+// DemoteActiveToWarm 将 active 代理降级到 warm（池子缩容时使用）
+func (s *Storage) DemoteActiveToWarm(address string) error {
+	_, err := s.db.Exec(
+		`UPDATE proxies SET status = 'warm' WHERE address = ? AND status = 'active'`,
+		address,
+	)
+	return err
 }
 
 // Close 关闭数据库

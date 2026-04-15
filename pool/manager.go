@@ -31,6 +31,9 @@ type PoolStatus struct {
 	AvgLatencyHTTP   int
 	AvgLatencySocks5 int
 	CustomCount      int // 订阅代理数量
+	WarmHTTP         int // warm 池 HTTP 数量
+	WarmSOCKS5       int // warm 池 SOCKS5 数量
+	WarmTotal        int // warm 池总数
 }
 
 // GetStatus 获取当前池子状态
@@ -49,6 +52,8 @@ func (m *Manager) GetStatus() (*PoolStatus, error) {
 	state := m.determineState(total, httpCount, socks5Count)
 
 	customCount, _ := m.storage.CountBySource("custom")
+	warmHTTP, _ := m.storage.CountWarmByProtocol("http")
+	warmSOCKS5, _ := m.storage.CountWarmByProtocol("socks5")
 
 	return &PoolStatus{
 		Total:            total,
@@ -60,6 +65,9 @@ func (m *Manager) GetStatus() (*PoolStatus, error) {
 		AvgLatencyHTTP:   avgHTTP,
 		AvgLatencySocks5: avgSOCKS5,
 		CustomCount:      customCount,
+		WarmHTTP:         warmHTTP,
+		WarmSOCKS5:       warmSOCKS5,
+		WarmTotal:        warmHTTP + warmSOCKS5,
 	}, nil
 }
 
@@ -105,6 +113,10 @@ func (m *Manager) NeedsFetch(status *PoolStatus) (bool, string, string) {
 	requireHTTP := status.HTTPSlots > 0
 	requireSOCKS5 := status.SOCKS5Slots > 0
 
+	// 双协议都空：不指定协议偏好，同时补充两个协议
+	if requireHTTP && status.HTTP == 0 && requireSOCKS5 && status.SOCKS5 == 0 {
+		return true, "emergency", ""
+	}
 	// 单协议缺失：紧急模式，指定协议
 	if requireHTTP && status.HTTP == 0 {
 		return true, "emergency", "http"
@@ -144,14 +156,33 @@ func (m *Manager) NeedsFetch(status *PoolStatus) (bool, string, string) {
 		return true, "refill", ""
 	}
 
-	// 健康状态：不需要补充抓取
+	// 健康状态：检查 warm 池是否需要补充
+	// warm 池低于 active 池容量的 50% 时，以 refill 模式补充（填入 warm 池）
+	warmTotal := status.WarmHTTP + status.WarmSOCKS5
+	warmTarget := m.cfg.PoolMaxSize / 2
+	if warmTotal < warmTarget {
+		return true, "refill", ""
+	}
+
 	return false, "", ""
 }
 
-// NeedsFetchQuick 快速判断是否还需要抓取（用于提前终止）
+// NeedsFetchQuick 快速判断 active 池是否还需要抓取（用于验证循环提前终止）
+// 只看 active 池状态，不考虑 warm 池，避免 warm 不足导致验证循环永不停止
 func (m *Manager) NeedsFetchQuick(status *PoolStatus) bool {
-	need, _, _ := m.NeedsFetch(status)
-	return need
+	requireHTTP := status.HTTPSlots > 0
+	requireSOCKS5 := status.SOCKS5Slots > 0
+
+	if requireHTTP && status.HTTP == 0 {
+		return true
+	}
+	if requireSOCKS5 && status.SOCKS5 == 0 {
+		return true
+	}
+	if status.State == "emergency" || status.State == "critical" || status.State == "warning" {
+		return true
+	}
+	return false
 }
 
 // TryAddProxy 尝试将代理加入池子，httpsLatencyMs 为 Kiro HTTPS 探测延迟
@@ -226,11 +257,42 @@ func (m *Manager) TryAddProxy(p storage.Proxy, httpsLatencyMs ...int) (bool, str
 		added, reason := m.tryReplace(p)
 		if added {
 			markKiro(p.Address)
+			return added, reason
 		}
-		return added, reason
+		// 替换失败，尝试存入 warm 池备用
+		if m.addToWarm(p, kiroMs) {
+			return false, "added_warm"
+		}
+		return false, "warm_full"
 	}
 
-	return false, "slots_full"
+	// 所有路径都走不通，尝试存入 warm 池
+	if m.addToWarm(p, kiroMs) {
+		return false, "added_warm"
+	}
+	return false, "warm_full"
+}
+
+// addToWarm 将代理存入 warm 池备用（warm 池上限为 active 池容量的 2 倍）
+func (m *Manager) addToWarm(p storage.Proxy, kiroMs int) bool {
+	warmCap := m.cfg.PoolMaxSize * 2
+	warmTotal, _ := m.storage.CountWarm()
+	if warmTotal >= warmCap {
+		return false
+	}
+
+	source := p.Source
+	if source == "" {
+		source = "free"
+	}
+	if err := m.storage.AddProxyWarm(p.Address, p.Protocol, source); err != nil {
+		return false
+	}
+	m.storage.UpdateExitInfo(p.Address, p.ExitIP, p.ExitLocation, p.Latency)
+	if kiroMs > 0 {
+		m.storage.UpdateKiroValidation(p.Address, kiroMs)
+	}
+	return true
 }
 
 // tryReplace 尝试替换现有代理
@@ -256,6 +318,40 @@ func (m *Manager) tryReplace(newProxy storage.Proxy) (bool, string) {
 	}
 
 	return false, "not_better"
+}
+
+// PromoteIfNeeded 检查 active 池是否掉量，自动从 warm 池提升
+// 返回本次提升的总数
+func (m *Manager) PromoteIfNeeded() int {
+	httpSlots, socks5Slots := m.cfg.CalculateSlots()
+	httpCount, _ := m.storage.CountByProtocol("http")
+	socks5Count, _ := m.storage.CountByProtocol("socks5")
+
+	totalPromoted := 0
+
+	// HTTP 不足时从 warm 提升
+	if httpSlots > 0 && httpCount < httpSlots {
+		need := httpSlots - httpCount
+		promoted, err := m.storage.PromoteWarmToActive("http", need)
+		if err == nil && promoted > 0 {
+			log.Printf("[pool] warm→active 提升 %d 个 HTTP 代理 (当前 %d/%d)",
+				promoted, httpCount+int(promoted), httpSlots)
+			totalPromoted += int(promoted)
+		}
+	}
+
+	// SOCKS5 不足时从 warm 提升
+	if socks5Slots > 0 && socks5Count < socks5Slots {
+		need := socks5Slots - socks5Count
+		promoted, err := m.storage.PromoteWarmToActive("socks5", need)
+		if err == nil && promoted > 0 {
+			log.Printf("[pool] warm→active 提升 %d 个 SOCKS5 代理 (当前 %d/%d)",
+				promoted, socks5Count+int(promoted), socks5Slots)
+			totalPromoted += int(promoted)
+		}
+	}
+
+	return totalPromoted
 }
 
 // AdjustForConfigChange 配置变更后调整池子

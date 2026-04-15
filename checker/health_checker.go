@@ -46,8 +46,15 @@ func (hc *HealthChecker) RunOnce() {
 
 	log.Printf("[health] 检查 %d 个代理", len(proxies))
 
+	// 防雪崩：单次健康检查最多移除 50% 的被检代理
+	maxRemove := len(proxies) / 2
+	if maxRemove < 3 {
+		maxRemove = 3
+	}
+
 	validCount := 0
 	removeCount := 0
+	degradeCount := 0
 	updateCount := 0
 
 	for result := range hc.validator.ValidateStream(proxies) {
@@ -57,34 +64,39 @@ func (hc *HealthChecker) RunOnce() {
 			if err := hc.storage.UpdateExitInfo(result.Proxy.Address, result.ExitIP, result.ExitLocation, latencyMs); err == nil {
 				updateCount++
 			}
-			// 健康检查通过：重置 fail_count 和 consecutive_fails，让恢复的代理重新可用
 			hc.storage.ResetFail(result.Proxy.Address)
 			hc.storage.ResetConsecutiveFails(result.Proxy.Address)
-			// 更新 Kiro 验证信息（如果 HTTPS 探测有延迟数据）
 			if result.HTTPSLatency > 0 {
 				httpsMs := int(result.HTTPSLatency.Milliseconds())
 				hc.storage.UpdateKiroValidation(result.Proxy.Address, httpsMs)
 			}
 		} else {
 			hc.storage.IncrementFailCount(result.Proxy.Address)
-			// 连续失败计数
 			consecutiveCount, _ := hc.storage.IncrementConsecutiveFails(result.Proxy.Address)
-			// 连续失败达阈值 或 总失败次数 >= 3 时踢出
 			shouldRemove := result.Proxy.FailCount+1 >= 3 || consecutiveCount >= hc.cfg.ConsecutiveFailThreshold
 			if shouldRemove {
+				if removeCount >= maxRemove {
+					// 达到移除上限，只标记 degraded 不删除，等下一轮再处理
+					hc.storage.MarkDegraded(result.Proxy.Address)
+					degradeCount++
+					continue
+				}
 				if result.Proxy.Source == "custom" {
 					hc.storage.DisableProxy(result.Proxy.Address)
 				} else {
 					hc.storage.Delete(result.Proxy.Address)
 				}
 				removeCount++
+			} else {
+				hc.storage.MarkDegraded(result.Proxy.Address)
+				degradeCount++
 			}
 		}
 	}
 
 	elapsed := time.Since(start)
-	log.Printf("[health] 完成: 验证%d 有效%d 更新%d 移除%d 耗时%v",
-		len(proxies), validCount, updateCount, removeCount, elapsed)
+	log.Printf("[health] 完成: 验证%d 有效%d 更新%d 移除%d 降级%d 耗时%v",
+		len(proxies), validCount, updateCount, removeCount, degradeCount, elapsed)
 }
 
 // RunQuickCheck 快速连通性检测：只测 HTTP 204，不做 HTTPS/IP 探测
@@ -122,6 +134,49 @@ func (hc *HealthChecker) RunQuickCheck() {
 	}
 }
 
+// RunWarmCheck 检查 warm 池代理的连通性，失败的直接删除
+func (hc *HealthChecker) RunWarmCheck() {
+	proxies, err := hc.storage.GetWarmProxies(0)
+	if err != nil || len(proxies) == 0 {
+		return
+	}
+
+	start := time.Now()
+	aliveCount := 0
+	removeCount := 0
+
+	for result := range hc.validator.ValidateStream(proxies) {
+		if result.Valid {
+			aliveCount++
+			latencyMs := int(result.Latency.Milliseconds())
+			hc.storage.UpdateExitInfo(result.Proxy.Address, result.ExitIP, result.ExitLocation, latencyMs)
+			hc.storage.ResetFail(result.Proxy.Address)
+			hc.storage.ResetConsecutiveFails(result.Proxy.Address)
+			if result.HTTPSLatency > 0 {
+				httpsMs := int(result.HTTPSLatency.Milliseconds())
+				hc.storage.UpdateKiroValidation(result.Proxy.Address, httpsMs)
+			}
+		} else {
+			// warm 池代理失败 2 次直接删除，不做降级
+			hc.storage.IncrementFailCount(result.Proxy.Address)
+			count, _ := hc.storage.IncrementConsecutiveFails(result.Proxy.Address)
+			if result.Proxy.FailCount+1 >= 2 || count >= 2 {
+				if result.Proxy.Source == "custom" {
+					hc.storage.DisableProxy(result.Proxy.Address)
+				} else {
+					hc.storage.Delete(result.Proxy.Address)
+				}
+				removeCount++
+			}
+		}
+	}
+
+	elapsed := time.Since(start)
+	if removeCount > 0 || aliveCount > 0 {
+		log.Printf("[health-warm] warm 池检查完成: %d 个存活 %d 个移除 耗时%v", aliveCount, removeCount, elapsed)
+	}
+}
+
 // StartBackground 后台定时健康检查
 func (hc *HealthChecker) StartBackground() {
 	// 完整检查：每 HealthCheckInterval 分钟，含 Kiro HTTPS 探测
@@ -140,5 +195,15 @@ func (hc *HealthChecker) StartBackground() {
 		}
 	}()
 
-	log.Printf("[health] 健康检查器已启动：快速检测 1分钟/次，完整检查 %d分钟/次", hc.cfg.HealthCheckInterval)
+	// warm 池健康检查：每 HealthCheckInterval*2 分钟
+	warmInterval := time.Duration(hc.cfg.HealthCheckInterval*2) * time.Minute
+	warmTicker := time.NewTicker(warmInterval)
+	go func() {
+		for range warmTicker.C {
+			hc.RunWarmCheck()
+		}
+	}()
+
+	log.Printf("[health] 健康检查器已启动：快速检测 1分钟/次，完整检查 %d分钟/次，warm 池检查 %d分钟/次",
+		hc.cfg.HealthCheckInterval, hc.cfg.HealthCheckInterval*2)
 }

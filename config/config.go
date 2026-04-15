@@ -54,9 +54,10 @@ type Config struct {
 	DBPath string
 
 	// ========== 池子容量配置 ==========
-	PoolMaxSize        int     // 代理池总容量（默认100）
-	PoolHTTPRatio      float64 // HTTP协议占比（默认0.5）
-	PoolMinPerProtocol int     // 每协议最小保证（默认10）
+	PoolMaxSize                int     // 代理池总容量（默认100）
+	PoolHTTPRatio              float64 // HTTP协议占比（默认0.5）
+	PoolMinPerProtocol         int     // 每协议最小保证（默认10）
+	MaxCandidatesPerProtocol   int     // 每轮补池每协议最大验证候选数（默认3000，防止验证超大候选集）
 
 	// ========== 延迟标准配置 ==========
 	MaxLatencyMs          int // 标准模式最大延迟（默认2000ms）
@@ -222,9 +223,10 @@ func DefaultConfig() *Config {
 		AllowedCountries: allowedCountries,
 
 		// 池子容量配置
-		PoolMaxSize:        100, // 总容量
-		PoolHTTPRatio:      0.3, // HTTP占30%
-		PoolMinPerProtocol: 10,  // 每协议最少10个
+		PoolMaxSize:              100,  // 总容量
+		PoolHTTPRatio:            0.3,  // HTTP占30%
+		PoolMinPerProtocol:       10,   // 每协议最少10个
+		MaxCandidatesPerProtocol: 3000, // 每轮补池每协议最多验证3000个候选
 
 		// 延迟标准配置
 		MaxLatencyMs:          2500, // 标准2.5秒
@@ -248,7 +250,7 @@ func DefaultConfig() *Config {
 		TunnelIdleTimeout:        58,   // 隧道空闲超时58秒
 		KiroLatencyThreshold:     3000, // Kiro HTTPS探测延迟阈值3000ms
 		CriticalHosts:            []string{"amazonaws.com"},
-		ConsecutiveFailThreshold: 2, // 连续失败2次踢出
+		ConsecutiveFailThreshold: 3, // 连续失败3次踢出（前2次标记degraded，第3次移除）
 
 		// 优化配置
 		OptimizeInterval:    30,  // 30分钟
@@ -298,6 +300,9 @@ func Load() *Config {
 			}
 			if saved.PoolMinPerProtocol != nil && *saved.PoolMinPerProtocol >= 0 {
 				cfg.PoolMinPerProtocol = *saved.PoolMinPerProtocol
+			}
+			if saved.MaxCandidatesPerProtocol > 0 {
+				cfg.MaxCandidatesPerProtocol = saved.MaxCandidatesPerProtocol
 			}
 
 			// 延迟配置
@@ -408,9 +413,10 @@ func Get() *Config {
 // savedConfig 持久化可调整的字段
 type savedConfig struct {
 	// 池子配置
-	PoolMaxSize        int     `json:"pool_max_size"`
-	PoolHTTPRatio      float64 `json:"pool_http_ratio"`
-	PoolMinPerProtocol *int    `json:"pool_min_per_protocol"`
+	PoolMaxSize              int     `json:"pool_max_size"`
+	PoolHTTPRatio            float64 `json:"pool_http_ratio"`
+	PoolMinPerProtocol       *int    `json:"pool_min_per_protocol"`
+	MaxCandidatesPerProtocol int     `json:"max_candidates_per_protocol,omitempty"`
 
 	// 延迟配置
 	MaxLatencyMs        int `json:"max_latency_ms"`
@@ -467,6 +473,7 @@ func Save(cfg *Config) error {
 		PoolMaxSize:              cfg.PoolMaxSize,
 		PoolHTTPRatio:            cfg.PoolHTTPRatio,
 		PoolMinPerProtocol:       &poolMinPerProtocol,
+		MaxCandidatesPerProtocol: cfg.MaxCandidatesPerProtocol,
 		MaxLatencyMs:             cfg.MaxLatencyMs,
 		MaxLatencyEmergency:      cfg.MaxLatencyEmergency,
 		MaxLatencyHealthy:        cfg.MaxLatencyHealthy,
